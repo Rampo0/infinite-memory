@@ -38,6 +38,10 @@ func main() {
 		cmdInit()
 	case "search":
 		cmdSearch(os.Args[2:])
+	case "entities":
+		cmdEntities(os.Args[2:])
+	case "entity":
+		cmdEntity(os.Args[2:])
 	case "status":
 		cmdStatus()
 	case "hooks-json":
@@ -57,6 +61,8 @@ func usage() {
   imem hook user-prompt|stop|session-end   hook entrypoints (stdin JSON from Claude Code)
   imem init                            ensure Memgraph schema, list indexes/constraints
   imem search "query" [--cwd path]     search memories via the daemon
+  imem entities [--project] [--limit N]    list entities by mention count (global by default)
+  imem entity <name...>                one entity: relations + memories mentioning it
   imem status                          daemon + graph health and per-project counts
   imem hooks-json                      print the ~/.claude/settings.json hooks snippet
 `)
@@ -176,6 +182,98 @@ func cmdSearch(args []string) {
 	fmt.Printf("project: %s (%d hits)\n", out.Project, len(out.Memories))
 	for _, m := range out.Memories {
 		fmt.Printf("  [%s] %s — %s (score %.2f)\n", m.Kind, m.Title, m.Content, m.Score)
+	}
+}
+
+func cmdEntities(args []string) {
+	cfg := config.Load()
+	limit, scoped := "50", false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--project":
+			scoped = true
+		case "--limit":
+			if i+1 < len(args) {
+				limit = args[i+1]
+				i++
+			}
+		}
+	}
+	vals := url.Values{"limit": {limit}}
+	scope := "all projects"
+	if scoped {
+		cwd, _ := os.Getwd()
+		vals.Set("cwd", cwd)
+		scope = "current project"
+	}
+	var out struct {
+		Entities []graph.EntityInfo `json:"entities"`
+	}
+	if err := getJSON(cfg.BaseURL()+"/v1/entities?"+vals.Encode(), &out); err != nil {
+		fmt.Fprintln(os.Stderr, "daemon unreachable:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("entities (%s, %d shown, by mention count):\n", scope, len(out.Entities))
+	for _, e := range out.Entities {
+		fmt.Printf("  %3dx  %-40s [%s]  %s\n", e.Mentions, e.Name, e.Etype, filepath.Base(e.ProjectKey))
+	}
+}
+
+func cmdEntity(args []string) {
+	name := strings.TrimSpace(strings.Join(args, " "))
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "usage: imem entity <name...>")
+		os.Exit(2)
+	}
+	cfg := config.Load()
+	var d graph.EntityDetail
+	u := cfg.BaseURL() + "/v1/entity?" + url.Values{"name": {name}}.Encode()
+	if err := getJSON(u, &d); err != nil {
+		fmt.Fprintln(os.Stderr, "daemon unreachable:", err)
+		os.Exit(1)
+	}
+	if len(d.Nodes) == 0 {
+		fmt.Printf("no entity matching %q\n", name)
+		return
+	}
+
+	fmt.Printf("%s [%s] — appears in:", d.Nodes[0].Name, d.Nodes[0].Etype)
+	for _, n := range d.Nodes {
+		fmt.Printf(" %s(%dx)", filepath.Base(n.ProjectKey), n.Mentions)
+	}
+	fmt.Println()
+
+	if len(d.Relations) > 0 {
+		fmt.Printf("\nrelations (%d):\n", len(d.Relations))
+		for _, r := range d.Relations {
+			verb := r.Verb
+			if verb == "" {
+				verb = "related-to"
+			}
+			fmt.Printf("  %-12s → %-40s [%s] w%d  %s\n", verb, r.Name, r.Etype, r.Weight, filepath.Base(r.ProjectKey))
+		}
+	}
+
+	if len(d.Memories) > 0 {
+		fmt.Printf("\nmemories (%d):\n", len(d.Memories))
+		now := time.Now().Unix()
+		for _, m := range d.Memories {
+			fmt.Printf("  [%s] %s — %s (%s, %s)\n", m.Kind, m.Title, m.Content, filepath.Base(m.ProjectKey), ago(now, m.LastSeen))
+		}
+	}
+}
+
+func ago(now, ts int64) string {
+	d := time.Duration(now-ts) * time.Second
+	switch {
+	case d < 90*time.Second:
+		return "just now"
+	case d < 90*time.Minute:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 36*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	}
 }
 

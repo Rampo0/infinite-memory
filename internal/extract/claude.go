@@ -25,7 +25,7 @@ const ExtractionSchema = `{
         "properties": {
           "title": {"type": "string"},
           "content": {"type": "string"},
-          "type": {"type": "string", "enum": ["fact", "decision", "preference", "reference"]},
+          "type": {"type": "string", "enum": ["fact", "decision", "preference", "reference", "rule"]},
           "entities": {
             "type": "array",
             "items": {

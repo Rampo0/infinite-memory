@@ -51,7 +51,10 @@ func Run(cfg config.Config) error {
 	s := &server{
 		cfg:   cfg,
 		store: store,
-		retr:  &retrieve.Retriever{Store: store, K: cfg.RetrieveK, MaxContentChars: cfg.MaxMemoryContentChars},
+		retr: &retrieve.Retriever{
+			Store: store, K: cfg.RetrieveK, MaxContentChars: cfg.MaxMemoryContentChars,
+			SameProjectBoost: cfg.SameProjectBoost, RulesK: cfg.RulesK,
+		},
 		log:   log,
 	}
 	worker := NewWorker(store, cfg, log)
@@ -67,6 +70,8 @@ func Run(cfg config.Config) error {
 	mux.HandleFunc("POST /v1/retrieve", s.handleRetrieve)
 	mux.HandleFunc("POST /v1/extract", s.handleExtract)
 	mux.HandleFunc("GET /v1/memories", s.handleMemories)
+	mux.HandleFunc("GET /v1/entities", s.handleEntities)
+	mux.HandleFunc("GET /v1/entity", s.handleEntity)
 	mux.HandleFunc("GET /v1/stats", s.handleStats)
 	mux.HandleFunc("POST /v1/flush", s.handleFlush)
 
@@ -186,7 +191,10 @@ func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	retr := &retrieve.Retriever{Store: s.store, K: limit, MaxContentChars: s.cfg.MaxMemoryContentChars}
+	retr := &retrieve.Retriever{
+		Store: s.store, K: limit, MaxContentChars: s.cfg.MaxMemoryContentChars,
+		SameProjectBoost: s.cfg.SameProjectBoost, RulesK: 0,
+	}
 	scored, err := retr.Query(ctx, pk, prompt, time.Now().Unix())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -196,6 +204,47 @@ func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
 		scored = []retrieve.Scored{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"project": pk, "memories": scored})
+}
+
+// handleEntities lists entities globally, or scoped to one project when a
+// cwd query param is given.
+func (s *server) handleEntities(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	pk := ""
+	if cwd := qv.Get("cwd"); cwd != "" {
+		pk = project.ResolveKey(cwd)
+	}
+	limit := 50
+	if n, err := strconv.Atoi(qv.Get("limit")); err == nil && n > 0 && n <= 500 {
+		limit = n
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	list, err := s.store.EntityList(ctx, pk, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if list == nil {
+		list = []graph.EntityInfo{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"project": pk, "entities": list})
+}
+
+func (s *server) handleEntity(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if strings.TrimSpace(name) == "" {
+		http.Error(w, "name query param required", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	detail, err := s.store.EntityDetail(ctx, name)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {

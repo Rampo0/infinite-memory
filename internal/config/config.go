@@ -23,6 +23,11 @@ type Config struct {
 	MaxTranscriptChars    int    `json:"max_transcript_chars"`
 	MaxMemoryContentChars int    `json:"max_memory_content_chars"`
 	LogFile               string `json:"log_file"`
+	// SameProjectBoost is added to scores of memories from the current
+	// project; retrieval itself is global (topic-based, not cwd-based).
+	SameProjectBoost float64 `json:"same_project_boost"`
+	// RulesK caps the always-injected standing-rules section (0 disables).
+	RulesK int `json:"rules_k"`
 }
 
 func Default() Config {
@@ -37,6 +42,8 @@ func Default() Config {
 		MaxTranscriptChars:    24000,
 		MaxMemoryContentChars: 400,
 		LogFile:               "~/.local/state/infinite-memory/imemd.log",
+		SameProjectBoost:      1.0,
+		RulesK:                50,
 	}
 }
 
@@ -59,11 +66,14 @@ func Load() Config {
 	if cfg.DebounceSeconds <= 0 {
 		cfg.DebounceSeconds = Default().DebounceSeconds
 	}
+	if cfg.RulesK < 0 {
+		cfg.RulesK = 0
+	}
 	return cfg
 }
 
-func (c Config) BaseURL() string          { return "http://" + c.HTTPAddr }
-func (c Config) Debounce() time.Duration  { return time.Duration(c.DebounceSeconds) * time.Second }
+func (c Config) BaseURL() string         { return "http://" + c.HTTPAddr }
+func (c Config) Debounce() time.Duration { return time.Duration(c.DebounceSeconds) * time.Second }
 func (c Config) RetrieveTO() time.Duration {
 	if c.RetrieveTimeoutMS <= 0 {
 		return 300 * time.Millisecond

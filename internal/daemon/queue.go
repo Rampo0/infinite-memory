@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -246,6 +247,17 @@ func (w *Worker) Process(j Job) error {
 	if err != nil {
 		w.Log.Warn("entity names fetch failed", "err", err)
 		known = nil
+	}
+	if global, err := w.Store.EntityNamesGlobal(ctx, 15); err == nil {
+		seen := make(map[string]bool, len(known))
+		for _, n := range known {
+			seen[strings.ToLower(n)] = true
+		}
+		for _, n := range global {
+			if !seen[strings.ToLower(n)] {
+				known = append(known, n)
+			}
+		}
 	}
 
 	prompt := extract.BuildPrompt(pk, known, turns)

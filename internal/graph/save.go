@@ -285,6 +285,27 @@ func (s *Store) EntityNames(ctx context.Context, pk string, limit int) ([]string
 	return names, res.Err()
 }
 
+// EntityNamesGlobal returns recent entity names across all projects, used as
+// cross-repo canonicalization hints (topics span repositories).
+func (s *Store) EntityNamesGlobal(ctx context.Context, limit int) ([]string, error) {
+	sess := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer sess.Close(ctx)
+	q := fmt.Sprintf(
+		"MATCH (e:Entity) RETURN e.name AS name ORDER BY e.created_at DESC LIMIT %d",
+		limit)
+	res, err := sess.Run(ctx, q, nil)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for res.Next(ctx) {
+		if n := recStr(res.Record(), "name"); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names, res.Err()
+}
+
 type ProjectStats struct {
 	Key      string `json:"key"`
 	Memories int64  `json:"memories"`

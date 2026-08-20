@@ -16,7 +16,7 @@ const (
 )
 
 var validKinds = map[string]bool{
-	"fact": true, "decision": true, "preference": true, "reference": true,
+	"fact": true, "decision": true, "preference": true, "reference": true, "rule": true,
 }
 
 type rawMemory struct {

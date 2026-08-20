@@ -10,5 +10,7 @@
   "debounce_seconds": 45,
   "max_transcript_chars": 24000,
   "max_memory_content_chars": 400,
-  "log_file": "~/.local/state/infinite-memory/imemd.log"
+  "log_file": "~/.local/state/infinite-memory/imemd.log",
+  "same_project_boost": 1.0,
+  "rules_k": 3
 }

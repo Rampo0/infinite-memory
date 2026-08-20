@@ -33,13 +33,20 @@ pick them up automatically.
 
 ## How it works
 
-- **Memories** are `fact | decision | preference | reference` nodes partitioned per
-  project (git root of the session cwd), linked to `Entity` nodes (`MENTIONS`) with
-  co-occurrence `RELATED` edges between entities.
-- **Retrieval** (no embeddings): shared tokenizer on save + query; candidates from
-  direct keyword hits, entity-name hits (2x weight), and 1-hop `RELATED` expansion;
-  scored with recency decay (`2·e^(-age/14d)`) and a `seen_count` bonus; top 6 formatted
-  into an `<infinite-memory>` context block.
+- **Memories** are `fact | decision | preference | rule | reference` nodes tagged with
+  the project they came from (git root of the session cwd), linked to `Entity` nodes
+  (`MENTIONS`) with co-occurrence `RELATED` edges. Extraction is told to always tag the
+  business/domain topic ("personal amend request", "jago whitelist", "BCA API") as an
+  entity — topics are the retrieval index.
+- **Retrieval is GLOBAL, topic-based — not cwd-partitioned** (no embeddings): shared
+  tokenizer on save + query; candidates from direct keyword hits, entity-name hits
+  (2x weight), and 1-hop `RELATED` expansion across ALL projects; scored with recency
+  decay (`2·e^(-age/14d)`), a `seen_count` bonus, and a same-project boost
+  (`same_project_boost`, default 1.0) so local context wins ties without hiding other
+  repos. Foreign memories carry a `from <project>` marker.
+- **Standing rules**: `rule` memories (coding constitution — LOC limits, max args,
+  per-repo patterns, code style, MR templates) are ALWAYS injected, current-project
+  first, capped by `rules_k` (default 3) — independent of keyword match.
 - **Extraction**: Stop events debounce 45s per session; the worker reads the transcript
   delta since the stored cursor, prompts `claude -p --model claude-haiku-4-5-20251001`
   with `--json-schema` structured output, and MERGEs results into the graph
@@ -54,7 +61,9 @@ pick them up automatically.
 
 ```sh
 imem status                  # daemon + memgraph health, per-project counts
-imem search "query"          # search memories for the current project
+imem search "query"          # search memories (global, boosted for current project)
+imem entities [--project] [--limit N]   # entities by mention count (global by default)
+imem entity <name...>        # one entity: relations (verb/weight) + memories mentioning it
 tail -f ~/.local/state/infinite-memory/imemd.log
 make cypher                  # mgconsole inside the container
 make test                    # unit tests
