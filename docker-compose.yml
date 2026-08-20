@@ -1,0 +1,22 @@
+services:
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    ports:
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7444:7444"
+    volumes:
+      - mg_lib:/var/lib/memgraph
+      - mg_log:/var/log/memgraph
+    command: ["--log-level=WARNING", "--also-log-to-stderr"]
+    restart: unless-stopped
+  lab:
+    image: memgraph/lab:latest
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      QUICK_CONNECT_MG_HOST: memgraph
+    depends_on:
+      - memgraph
+volumes:
+  mg_lib:
+  mg_log:

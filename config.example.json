@@ -1,0 +1,14 @@
+{
+  "http_addr": "127.0.0.1:7690",
+  "memgraph_uri": "bolt://127.0.0.1:7687",
+  "memgraph_user": "",
+  "memgraph_pass": "",
+  "claude_bin": "claude",
+  "extract_model": "claude-haiku-4-5-20251001",
+  "retrieve_k": 6,
+  "retrieve_timeout_ms": 300,
+  "debounce_seconds": 45,
+  "max_transcript_chars": 24000,
+  "max_memory_content_chars": 400,
+  "log_file": "~/.local/state/infinite-memory/imemd.log"
+}
