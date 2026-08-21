@@ -23,13 +23,55 @@ Stop / SessionEnd ─ imem hook stop|session-end ─ POST /v1/extract ┤  fire-
 make up        # memgraph + memgraph-lab (http://localhost:3000)
 make install   # builds ~/.local/bin/imem
 make init      # schema: 8 indexes, 4 constraints
-make run       # daemon in foreground (or use launchd/com.ammar.imemd.plist)
+make run       # daemon in foreground (or install via launchd — section below)
 make hooks-json  # prints the snippet to merge into ~/.claude/settings.json
 ```
 
 Hooks are registered as additional array entries in `~/.claude/settings.json`
 (`UserPromptSubmit` → retrieve, `Stop`/`SessionEnd` → extract). New Claude Code sessions
 pick them up automatically.
+
+## launchd (macOS): run the daemon at login
+
+Install — the plist keeps the daemon alive and starts it at login:
+
+```sh
+pkill -f 'imem daemon' || true     # kill any manually started daemon first (port 7690 clash)
+mkdir -p ~/Library/LaunchAgents
+cp launchd/com.ammar.imemd.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ammar.imemd.plist
+```
+
+Restart — needed after every `make install` (launchd keeps running the old binary)
+or after changing `~/.config/infinite-memory/config.json`:
+
+```sh
+launchctl kickstart -k gui/$(id -u)/com.ammar.imemd
+```
+
+Check / logs:
+
+```sh
+launchctl print gui/$(id -u)/com.ammar.imemd | head -20   # state, pid, last exit code
+curl -s localhost:7690/healthz                             # {"ok":true,"memgraph":true}
+tail -f ~/.local/state/infinite-memory/imemd.log
+```
+
+Uninstall:
+
+```sh
+launchctl bootout gui/$(id -u)/com.ammar.imemd
+rm ~/Library/LaunchAgents/com.ammar.imemd.plist
+```
+
+Notes:
+- Older macOS syntax (still works): `launchctl load|unload ~/Library/LaunchAgents/com.ammar.imemd.plist`.
+- The plist has `KeepAlive.SuccessfulExit=false`: a crash restarts the daemon, but if
+  port 7690 is already taken by a manual daemon it will retry-loop — always `pkill` the
+  manual one before bootstrapping.
+- launchd only manages the daemon. Memgraph runs separately via Docker: after a Docker
+  restart run `docker compose up -d` in this repo (healthz shows `"memgraph":false`
+  until you do; hooks stay silent/fail-open, nothing breaks).
 
 ## How it works
 

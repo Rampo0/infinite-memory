@@ -4,13 +4,13 @@
   "memgraph_user": "",
   "memgraph_pass": "",
   "claude_bin": "claude",
-  "extract_model": "claude-haiku-4-5-20251001",
-  "retrieve_k": 6,
+  "extract_model": "claude-opus-5",
+  "retrieve_k": 10,
   "retrieve_timeout_ms": 300,
   "debounce_seconds": 45,
   "max_transcript_chars": 24000,
   "max_memory_content_chars": 400,
   "log_file": "~/.local/state/infinite-memory/imemd.log",
   "same_project_boost": 1.0,
-  "rules_k": 3
+  "rules_k": 50
 }
