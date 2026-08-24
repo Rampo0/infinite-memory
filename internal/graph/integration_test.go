@@ -5,8 +5,11 @@ package graph
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Rampo0/infinite-memory/internal/backup"
 )
 
 // Requires a running Memgraph (make up). Run with: make itest
@@ -316,5 +319,76 @@ func TestEntityNames(t *testing.T) {
 	}
 	if len(global) == 0 {
 		t.Fatal("global entity names empty")
+	}
+}
+
+// TestDump is read-only against the live graph: it never calls Restore, which
+// would DROP GRAPH on the developer's real memories.
+func TestDump(t *testing.T) {
+	s := testStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	stmts, err := s.Dump(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stmts) == 0 {
+		t.Fatal("dump is empty")
+	}
+	var constraints, cleanup int
+	for _, q := range stmts {
+		if strings.HasPrefix(q, "CREATE CONSTRAINT") {
+			constraints++
+		}
+		if strings.Contains(q, "REMOVE u:__mg_vertex__") {
+			cleanup++
+		}
+	}
+	if constraints == 0 {
+		t.Error("dump carries no CREATE CONSTRAINT statements, schema would be lost on restore")
+	}
+	if cleanup == 0 {
+		t.Error("dump carries no __mg_vertex__ cleanup statement")
+	}
+}
+
+// TestDumpIsReplayable is the regression guard for the bug that made the very
+// first restore fail: Entity.key carries a NUL separator, DUMP DATABASE emits
+// it raw, and Memgraph's own parser then rejects the statement. EXPLAIN parses
+// a query without running it, so this validates every escaped statement
+// against the live parser without touching the graph.
+func TestDumpIsReplayable(t *testing.T) {
+	s := testStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	stmts, err := s.Dump(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stmts) == 0 {
+		t.Skip("graph is empty, nothing to validate")
+	}
+
+	var checked, withEscapes int
+	for _, q := range stmts {
+		esc := backup.EscapeControl(q)
+		// Every statement carrying a control byte is a candidate for the bug;
+		// a slice of the rest keeps the test honest without 2000 round trips.
+		if esc == q && checked >= 50 {
+			continue
+		}
+		if esc != q {
+			withEscapes++
+		}
+		checked++
+		if err := s.explain(ctx, esc); err != nil {
+			t.Fatalf("statement is not replayable: %v\nquery: %.200q", err, esc)
+		}
+	}
+	t.Logf("validated %d/%d statements (%d needed escaping)", checked, len(stmts), withEscapes)
+	if withEscapes == 0 {
+		t.Log("note: no control bytes in this graph, the NUL path went unexercised")
 	}
 }

@@ -73,6 +73,56 @@ Notes:
   restart run `docker compose up -d` in this repo (healthz shows `"memgraph":false`
   until you do; hooks stay silent/fail-open, nothing breaks).
 
+## Backups
+
+The graph lives in the Docker volume `infinite-memory_mg_lib`. Memgraph snapshots itself
+every 5 min, but *into that same volume* — `docker compose down -v` or a Docker Desktop
+reset takes the data and every copy of it at once. So the daemon also dumps the graph to
+the host, outside Docker:
+
+```sh
+~/.local/state/infinite-memory/backups/imem-20260824-140000.cypherl.gz   # ~77 KB
+```
+
+Every 4 hours, keeping the 2 newest (`backup_interval_hours`, `backup_keep`,
+`backup_dir`, `backup_enabled` in config). The artifact is `DUMP DATABASE` output —
+plain Cypher, so it survives a `memgraph-mage:latest` version bump that a binary
+snapshot might not. Two details worth knowing: the loop compares wall-clock times
+instead of counting ticks, so a laptop that slept through the window backs up on wake;
+and a dump carrying no nodes is never written, so a blank Memgraph cannot age out both
+good backups (it does not dump *zero* statements — the schema is recreated at boot — so
+the check is for node data, not for length).
+
+```sh
+imem backups                 # list: size, age, newest first
+imem backup                  # dump now (also rotates)
+```
+
+Restore wipes the graph and replays the dump. It talks to Bolt directly, not via the
+daemon — you need it precisely when the daemon is down. It refuses a file that is not an
+imem dump, and without `--yes` it only prints what it would do:
+
+```sh
+imem restore ~/.local/state/infinite-memory/backups/imem-20260824-140000.cypherl.gz --yes
+imem init                    # verify indexes + constraints came back
+imem status                  # verify counts
+```
+
+Fallback if the binary is unavailable — wipe first, since the dump recreates the unique
+constraints (`DROP GRAPH` is rejected in the default `IN_MEMORY_TRANSACTIONAL` mode):
+
+```sh
+printf 'MATCH (n) DETACH DELETE n;\nDROP ALL CONSTRAINTS;\nDROP ALL INDEXES;\n' \
+  | docker compose exec -T memgraph mgconsole
+gunzip -c ~/.local/state/infinite-memory/backups/imem-20260824-033013.cypherl.gz \
+  | docker compose exec -T memgraph mgconsole
+```
+
+Memgraph's own `DUMP DATABASE` emits the NUL byte inside `Entity.key` raw, which its
+parser then rejects — `imem backup` escapes control bytes to `\uXXXX` on the way out, so
+the stored file is replayable by either route. `make itest` guards this by `EXPLAIN`-ing
+every escaped statement.
+
 ## How it works
 
 - **Memories** are `fact | decision | preference | rule | reference` nodes tagged with
@@ -106,6 +156,8 @@ imem status                  # daemon + memgraph health, per-project counts
 imem search "query"          # search memories (global, boosted for current project)
 imem entities [--project] [--limit N]   # entities by mention count (global by default)
 imem entity <name...>        # one entity: relations (verb/weight) + memories mentioning it
+imem backups                 # list host-side graph dumps (see Backups)
+imem backup                  # dump the graph now
 tail -f ~/.local/state/infinite-memory/imemd.log
 make cypher                  # mgconsole inside the container
 make test                    # unit tests

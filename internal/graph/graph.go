@@ -1,6 +1,8 @@
 // Package graph owns all Memgraph access: schema, writes (save/cursor) and
-// the retrieval candidate queries. Only the daemon and `imem init` construct
-// a Store — hook subcommands never touch Bolt.
+// the retrieval candidate queries. Only the daemon, `imem init` and
+// `imem restore` construct a Store — hook subcommands never touch Bolt.
+// `imem restore` is direct rather than daemon-mediated on purpose: a restore
+// is needed precisely when the daemon is down.
 package graph
 
 import (

@@ -28,6 +28,12 @@ type Config struct {
 	SameProjectBoost float64 `json:"same_project_boost"`
 	// RulesK caps the always-injected standing-rules section (0 disables).
 	RulesK int `json:"rules_k"`
+	// Backup* control the periodic Cypher dump the daemon writes outside the
+	// Docker volume, so losing the volume does not lose the graph.
+	BackupEnabled       bool   `json:"backup_enabled"`
+	BackupIntervalHours int    `json:"backup_interval_hours"`
+	BackupKeep          int    `json:"backup_keep"`
+	BackupDir           string `json:"backup_dir"`
 }
 
 func Default() Config {
@@ -44,6 +50,10 @@ func Default() Config {
 		LogFile:               "~/.local/state/infinite-memory/imemd.log",
 		SameProjectBoost:      1.0,
 		RulesK:                50,
+		BackupEnabled:         true,
+		BackupIntervalHours:   4,
+		BackupKeep:            2,
+		BackupDir:             "~/.local/state/infinite-memory/backups",
 	}
 }
 
@@ -69,6 +79,15 @@ func Load() Config {
 	if cfg.RulesK < 0 {
 		cfg.RulesK = 0
 	}
+	if cfg.BackupIntervalHours <= 0 {
+		cfg.BackupIntervalHours = Default().BackupIntervalHours
+	}
+	if cfg.BackupKeep <= 0 {
+		cfg.BackupKeep = Default().BackupKeep
+	}
+	if strings.TrimSpace(cfg.BackupDir) == "" {
+		cfg.BackupDir = Default().BackupDir
+	}
 	return cfg
 }
 
@@ -88,6 +107,17 @@ func (c Config) SpawnDir() string {
 }
 
 func (c Config) LogPath() string { return ExpandHome(c.LogFile) }
+
+// BackupPath is the host directory holding graph dumps. It deliberately lives
+// under ~/.local/state, never inside the Docker volume or the git worktree.
+func (c Config) BackupPath() string { return ExpandHome(c.BackupDir) }
+
+func (c Config) BackupInterval() time.Duration {
+	if c.BackupIntervalHours <= 0 {
+		return 4 * time.Hour
+	}
+	return time.Duration(c.BackupIntervalHours) * time.Hour
+}
 
 // ClaudeProjectsDir is where Claude Code writes transcripts.
 func ClaudeProjectsDir() string { return ExpandHome("~/.claude/projects") }

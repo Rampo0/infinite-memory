@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Rampo0/infinite-memory/internal/backup"
 	"github.com/Rampo0/infinite-memory/internal/config"
 	"github.com/Rampo0/infinite-memory/internal/graph"
 	"github.com/Rampo0/infinite-memory/internal/project"
@@ -30,6 +31,13 @@ type server struct {
 
 	schemaMu sync.Mutex
 	schemaOK bool
+
+	// backupMu serialises dump runs; backupStateMu guards the reported state
+	// so /v1/backups never blocks behind a running dump.
+	backupMu      sync.Mutex
+	backupStateMu sync.Mutex
+	lastBackup    backup.Info
+	lastBackupErr string
 }
 
 // Run starts the daemon in the foreground. The port bind doubles as the
@@ -55,11 +63,15 @@ func Run(cfg config.Config) error {
 			Store: store, K: cfg.RetrieveK, MaxContentChars: cfg.MaxMemoryContentChars,
 			SameProjectBoost: cfg.SameProjectBoost, RulesK: cfg.RulesK,
 		},
-		log:   log,
+		log: log,
 	}
 	worker := NewWorker(store, cfg, log)
 	s.queue = NewQueue(cfg.Debounce(), worker.Process, log)
 	s.queue.Start()
+
+	if cfg.BackupEnabled {
+		s.startBackupLoop()
+	}
 
 	// Memgraph may be down at startup: log and keep serving, the schema is
 	// re-attempted on the next successful health check.
@@ -74,6 +86,8 @@ func Run(cfg config.Config) error {
 	mux.HandleFunc("GET /v1/entity", s.handleEntity)
 	mux.HandleFunc("GET /v1/stats", s.handleStats)
 	mux.HandleFunc("POST /v1/flush", s.handleFlush)
+	mux.HandleFunc("POST /v1/backup", s.handleBackup)
+	mux.HandleFunc("GET /v1/backups", s.handleBackups)
 
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
@@ -274,4 +288,53 @@ func (s *server) handleFlush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleBackup forces a dump now, on top of the scheduled loop.
+func (s *server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.BackupEnabled {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "backups disabled in config"})
+		return
+	}
+	res, err := s.runBackup(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if res.Statements == 0 {
+		_, lastErr := s.backupStatus()
+		if lastErr == "" {
+			lastErr = "dump carried no nodes"
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{"error": lastErr + ", nothing written"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path": res.Info.Path, "bytes": res.Info.Size, "statements": res.Statements,
+	})
+}
+
+func (s *server) handleBackups(w http.ResponseWriter, r *http.Request) {
+	dir := s.cfg.BackupPath()
+	list, err := backup.List(dir)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if list == nil {
+		list = []backup.Info{}
+	}
+	_, lastErr := s.backupStatus()
+	out := map[string]any{
+		"enabled":        s.cfg.BackupEnabled,
+		"dir":            dir,
+		"interval_hours": s.cfg.BackupIntervalHours,
+		"keep":           s.cfg.BackupKeep,
+		"backups":        list,
+		"last_error":     lastErr,
+	}
+	if len(list) > 0 {
+		out["next_due"] = list[0].ModTime.Add(s.cfg.BackupInterval()).Unix()
+	}
+	writeJSON(w, http.StatusOK, out)
 }

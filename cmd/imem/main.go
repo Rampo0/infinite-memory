@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Rampo0/infinite-memory/internal/backup"
 	"github.com/Rampo0/infinite-memory/internal/client"
 	"github.com/Rampo0/infinite-memory/internal/config"
 	"github.com/Rampo0/infinite-memory/internal/daemon"
@@ -42,6 +43,12 @@ func main() {
 		cmdEntities(os.Args[2:])
 	case "entity":
 		cmdEntity(os.Args[2:])
+	case "backup":
+		cmdBackup()
+	case "backups":
+		cmdBackups()
+	case "restore":
+		cmdRestore(os.Args[2:])
 	case "status":
 		cmdStatus()
 	case "hooks-json":
@@ -63,6 +70,9 @@ func usage() {
   imem search "query" [--cwd path]     search memories via the daemon
   imem entities [--project] [--limit N]    list entities by mention count (global by default)
   imem entity <name...>                one entity: relations + memories mentioning it
+  imem backup                          dump the graph now to the backup dir
+  imem backups                         list backups (newest first)
+  imem restore <file> --yes            WIPE the graph and replay a backup
   imem status                          daemon + graph health and per-project counts
   imem hooks-json                      print the ~/.claude/settings.json hooks snippet
 `)
@@ -293,6 +303,140 @@ func cmdStatus() {
 			fmt.Printf("  %s: %d memories, %d entities, %d sessions\n", p.Key, p.Memories, p.Entities, p.Sessions)
 		}
 	}
+	var bk struct {
+		IntervalHours int           `json:"interval_hours"`
+		Keep          int           `json:"keep"`
+		Backups       []backup.Info `json:"backups"`
+		LastError     string        `json:"last_error"`
+	}
+	if err := getJSON(cfg.BaseURL()+"/v1/backups", &bk); err == nil {
+		if len(bk.Backups) == 0 {
+			fmt.Printf("backups: none yet (every %dh, keep %d)\n", bk.IntervalHours, bk.Keep)
+		} else {
+			b := bk.Backups[0]
+			fmt.Printf("backups: %d kept, last %s (%s), every %dh\n",
+				len(bk.Backups), ago(time.Now().Unix(), b.ModTime.Unix()), humanBytes(b.Size), bk.IntervalHours)
+		}
+		if bk.LastError != "" {
+			fmt.Printf("  backup error: %s\n", bk.LastError)
+		}
+	}
+}
+
+func cmdBackup() {
+	cfg := config.Load()
+	var out struct {
+		Path       string `json:"path"`
+		Bytes      int64  `json:"bytes"`
+		Statements int    `json:"statements"`
+		Error      string `json:"error"`
+	}
+	if err := postJSON(cfg.BaseURL()+"/v1/backup", &out); err != nil {
+		fmt.Fprintln(os.Stderr, "backup failed:", err)
+		if out.Error != "" {
+			fmt.Fprintln(os.Stderr, " ", out.Error)
+		}
+		os.Exit(1)
+	}
+	fmt.Printf("wrote %s (%s, %d statements)\n", out.Path, humanBytes(out.Bytes), out.Statements)
+}
+
+func cmdBackups() {
+	cfg := config.Load()
+	var out struct {
+		Enabled       bool          `json:"enabled"`
+		Dir           string        `json:"dir"`
+		IntervalHours int           `json:"interval_hours"`
+		Keep          int           `json:"keep"`
+		Backups       []backup.Info `json:"backups"`
+		LastError     string        `json:"last_error"`
+	}
+	if err := getJSON(cfg.BaseURL()+"/v1/backups", &out); err != nil {
+		fmt.Fprintln(os.Stderr, "daemon unreachable:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("backups: %s (every %dh, keep %d, enabled %v)\n", out.Dir, out.IntervalHours, out.Keep, out.Enabled)
+	if out.LastError != "" {
+		fmt.Printf("  last error: %s\n", out.LastError)
+	}
+	if len(out.Backups) == 0 {
+		fmt.Println("  none yet")
+		return
+	}
+	now := time.Now().Unix()
+	for _, b := range out.Backups {
+		fmt.Printf("  %-9s %-10s %s\n", humanBytes(b.Size), ago(now, b.ModTime.Unix()), filepath.Base(b.Path))
+	}
+}
+
+// cmdRestore talks to Bolt directly rather than through the daemon: a restore
+// is exactly what you need when the daemon is down or crash-looping.
+func cmdRestore(args []string) {
+	path, yes := "", false
+	for _, a := range args {
+		if a == "--yes" || a == "-y" {
+			yes = true
+			continue
+		}
+		if path == "" {
+			path = a
+		}
+	}
+	if path == "" {
+		fmt.Fprintln(os.Stderr, "usage: imem restore <file.cypherl.gz> --yes")
+		os.Exit(2)
+	}
+
+	stmts, err := backup.Load(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "read backup:", err)
+		os.Exit(1)
+	}
+	// A dump always carries the __mg_vertex__ scaffolding. Requiring it stops
+	// a wrong or truncated file from wiping a healthy graph.
+	if len(stmts) == 0 || !strings.Contains(strings.Join(stmts, "\n"), "__mg_vertex__") {
+		fmt.Fprintf(os.Stderr, "%s does not look like an imem dump (%d statements, no __mg_vertex__)\n", path, len(stmts))
+		os.Exit(1)
+	}
+
+	cfg := config.Load()
+	if !yes {
+		fmt.Fprintf(os.Stderr, `restore would DROP GRAPH on %s — deleting every node, edge,
+index and constraint — then replay %d statements from
+  %s
+
+Nothing has been changed. Re-run with --yes to proceed.
+`, cfg.MemgraphURI, len(stmts), path)
+		os.Exit(2)
+	}
+
+	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "driver:", err)
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if err := store.Ping(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "memgraph unreachable at %s: %v\n", cfg.MemgraphURI, err)
+		os.Exit(1)
+	}
+	if err := store.Restore(ctx, stmts); err != nil {
+		fmt.Fprintln(os.Stderr, "restore:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("restored %d statements from %s\n", len(stmts), path)
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.0fKB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 func cmdHooksJSON() {
@@ -331,6 +475,20 @@ func getJSON(u string, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func postJSON(u string, out any) error {
+	c := http.Client{Timeout: 90 * time.Second}
+	resp, err := c.Post(u, "application/json", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		_ = json.NewDecoder(resp.Body).Decode(out)
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)

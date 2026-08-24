@@ -2,7 +2,7 @@ BIN_DIR := bin
 BIN := $(BIN_DIR)/imem
 INSTALL_BIN := $(HOME)/.local/bin/imem
 
-.PHONY: build install run up down init test itest search status hooks-json cypher
+.PHONY: build install run up down init test itest search status hooks-json cypher backup backups restore
 
 build:
 	go build -o $(BIN) ./cmd/imem
@@ -40,3 +40,12 @@ hooks-json: build
 
 cypher:
 	docker compose exec memgraph mgconsole
+
+backup: build
+	$(BIN) backup
+
+backups: build
+	$(BIN) backups
+
+restore: build
+	$(BIN) restore "$(F)" --yes

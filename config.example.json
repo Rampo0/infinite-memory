@@ -12,5 +12,9 @@
   "max_memory_content_chars": 400,
   "log_file": "~/.local/state/infinite-memory/imemd.log",
   "same_project_boost": 1.0,
-  "rules_k": 50
+  "rules_k": 50,
+  "backup_enabled": true,
+  "backup_interval_hours": 4,
+  "backup_keep": 2,
+  "backup_dir": "~/.local/state/infinite-memory/backups"
 }
