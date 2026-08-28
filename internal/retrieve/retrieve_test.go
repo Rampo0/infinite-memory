@@ -32,7 +32,7 @@ func TestMergeAndScoreMergesSameID(t *testing.T) {
 	q1 := []graph.Candidate{cand("m", "/p", now, 1, 2)}
 	q2 := []graph.Candidate{cand("m", "/p", now, 1, 1)}
 	q3 := []graph.Candidate{cand("m", "/p", now, 1, 10)} // capped at 4
-	out := MergeAndScore(q1, q2, q3, now, "/other", 5.0)  // boost must NOT apply
+	out := MergeAndScore(q1, q2, q3, now, "/other", 5.0) // boost must NOT apply
 	if len(out) != 1 {
 		t.Fatalf("want 1 merged result, got %d", len(out))
 	}
@@ -82,6 +82,24 @@ func TestSortRules(t *testing.T) {
 	}
 }
 
+// k <= 0 means no cap: rules_k -1 injects every standing rule.
+func TestSortRulesNoLimit(t *testing.T) {
+	rules := []graph.Candidate{
+		{ID: "foreign", Kind: "rule", ProjectKey: "/other", SeenCount: 9, LastSeen: 100},
+		{ID: "local-old", Kind: "rule", ProjectKey: "/here", SeenCount: 1, LastSeen: 50},
+		{ID: "local-hot", Kind: "rule", ProjectKey: "/here", SeenCount: 5, LastSeen: 90},
+	}
+	for _, k := range []int{-1, -50} {
+		out := SortRules(rules, "/here", k, nil)
+		if len(out) != 3 {
+			t.Fatalf("k=%d must not cap, got %d rules", k, len(out))
+		}
+		if out[0].ID != "local-hot" || out[2].ID != "foreign" {
+			t.Fatalf("k=%d lost the ordering: %+v", k, out)
+		}
+	}
+}
+
 func TestFormatBlock(t *testing.T) {
 	now := int64(1_000_000)
 	mems := []Scored{{
@@ -123,5 +141,119 @@ func TestFormatBlockRulesOnly(t *testing.T) {
 	block := FormatBlock("/p", nil, rules, 100, 2)
 	if strings.Contains(block, "Long-term memories") || !strings.Contains(block, "[rule] Max args") {
 		t.Fatalf("rules-only block wrong:\n%s", block)
+	}
+}
+
+func summaryFixture(now int64) ([]Scored, []graph.Candidate) {
+	mems := []Scored{{
+		Candidate: graph.Candidate{
+			ID: "a", Title: "Recursion guard via env sentinel", Kind: "fact",
+			ProjectKey: "/proj", LastSeen: now - 7*86400,
+		},
+		Score: 8.42,
+	}, {
+		Candidate: graph.Candidate{
+			ID: "b", Title: "Field masks modeled as a domain enum, not proto types", Kind: "decision",
+			ProjectKey: "/Users/x/accountworkspace/opening-account", LastSeen: now - 3*3600,
+		},
+		Score: 7.05,
+	}, {
+		Candidate: graph.Candidate{
+			ID: "c", Title: "Third memory", Kind: "preference", ProjectKey: "/proj", LastSeen: now,
+		},
+		Score: 6.9,
+	}}
+	rules := []graph.Candidate{
+		{ID: "r1", Kind: "rule", Title: "Max args", ProjectKey: "/proj", LastSeen: now},
+		{ID: "r2", Kind: "rule", Title: "No bare worktrees", ProjectKey: "/proj", LastSeen: now},
+	}
+	return mems, rules
+}
+
+func TestFormatSummary(t *testing.T) {
+	now := int64(1_000_000_000)
+	mems, rules := summaryFixture(now)
+	got := FormatSummary("/proj", mems, rules, 6, now)
+	for _, want := range []string{
+		"[fact]",
+		"Recursion guard via env sentinel",
+		"7d ago",
+		"8.4", // score, one decimal
+		"[decision]",
+		"Field masks modeled as a domain enum, not proto…", // clipped to 48 runes
+		"↖opening-account", // foreign project marker
+		"[preference]",
+		"2 standing rules",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("summary missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "more") {
+		t.Fatalf("nothing was dropped, want no \"… N more\":\n%s", got)
+	}
+	if n := len(strings.Split(got, "\n")); n != 4 {
+		t.Fatalf("want 3 memory lines + tail, got %d lines:\n%s", n, got)
+	}
+	if strings.Contains(got, "↖proj") {
+		t.Fatalf("same-project memory must not be marked:\n%s", got)
+	}
+	if strings.HasSuffix(got, "\n") || strings.Contains(got, " \n") {
+		t.Fatalf("summary has trailing whitespace:\n%q", got)
+	}
+}
+
+func TestFormatSummaryCapsLines(t *testing.T) {
+	now := int64(1_000_000_000)
+	mems, rules := summaryFixture(now)
+	got := FormatSummary("/proj", mems, rules, 1, now)
+	if !strings.Contains(got, "… 2 more · 2 standing rules") {
+		t.Fatalf("want capped tail line:\n%s", got)
+	}
+	if strings.Contains(got, "Third memory") {
+		t.Fatalf("line beyond the cap leaked in:\n%s", got)
+	}
+	if n := len(strings.Split(got, "\n")); n != 2 {
+		t.Fatalf("want 1 memory line + tail, got %d:\n%s", n, got)
+	}
+}
+
+// hook_summary_lines -1 lists every memory, so no "… N more" tail.
+func TestFormatSummaryNoLimit(t *testing.T) {
+	now := int64(1_000_000_000)
+	mems, rules := summaryFixture(now)
+	got := FormatSummary("/proj", mems, rules, -1, now)
+	if strings.Contains(got, "more") {
+		t.Fatalf("maxLines -1 must not elide anything:\n%s", got)
+	}
+	if !strings.Contains(got, "Third memory") {
+		t.Fatalf("last memory missing:\n%s", got)
+	}
+	if n := len(strings.Split(got, "\n")); n != 4 {
+		t.Fatalf("want 3 memory lines + tail, got %d:\n%s", n, got)
+	}
+}
+
+func TestFormatSummaryRulesOnlyAndEmpty(t *testing.T) {
+	now := int64(1_000_000_000)
+	_, rules := summaryFixture(now)
+	if got := FormatSummary("/proj", nil, rules, 6, now); got != "  2 standing rules" {
+		t.Fatalf("rules-only summary wrong: %q", got)
+	}
+	if got := FormatSummary("/proj", nil, nil, 6, now); got != "" {
+		t.Fatalf("empty summary must be blank, got %q", got)
+	}
+}
+
+func TestTruncRunesNeverSplitsRunes(t *testing.T) {
+	got := truncRunes("héllo wörld ünicode", 8)
+	if got != "héllo w…" {
+		t.Fatalf("got %q", got)
+	}
+	if r := []rune(got); len(r) != 8 {
+		t.Fatalf("want 8 runes, got %d in %q", len(r), got)
+	}
+	if got := truncRunes("short", 48); got != "short" {
+		t.Fatalf("short titles must pass through, got %q", got)
 	}
 }

@@ -11,12 +11,14 @@ import (
 )
 
 type Config struct {
-	HTTPAddr              string `json:"http_addr"`
-	MemgraphURI           string `json:"memgraph_uri"`
-	MemgraphUser          string `json:"memgraph_user"`
-	MemgraphPass          string `json:"memgraph_pass"`
-	ClaudeBin             string `json:"claude_bin"`
-	ExtractModel          string `json:"extract_model"`
+	HTTPAddr     string `json:"http_addr"`
+	MemgraphURI  string `json:"memgraph_uri"`
+	MemgraphUser string `json:"memgraph_user"`
+	MemgraphPass string `json:"memgraph_pass"`
+	ClaudeBin    string `json:"claude_bin"`
+	ExtractModel string `json:"extract_model"`
+	// RetrieveK caps the keyword/entity-matched memories per prompt.
+	// -1 means no limit; 0 falls back to the default.
 	RetrieveK             int    `json:"retrieve_k"`
 	RetrieveTimeoutMS     int    `json:"retrieve_timeout_ms"`
 	DebounceSeconds       int    `json:"debounce_seconds"`
@@ -26,8 +28,17 @@ type Config struct {
 	// SameProjectBoost is added to scores of memories from the current
 	// project; retrieval itself is global (topic-based, not cwd-based).
 	SameProjectBoost float64 `json:"same_project_boost"`
-	// RulesK caps the always-injected standing-rules section (0 disables).
+	// RulesK caps the always-injected standing-rules section.
+	// 0 disables the section entirely; -1 means no limit.
 	RulesK int `json:"rules_k"`
+	// HookShowRetrieved makes the UserPromptSubmit hook print a compact
+	// summary of what it injected (plus the no-match and daemon-down cases)
+	// into the Claude Code CLI via the hook's systemMessage field.
+	HookShowRetrieved bool `json:"hook_show_retrieved"`
+	// HookSummaryLines caps the per-memory lines in that summary; anything
+	// beyond it collapses into a "… N more" line. -1 means no limit;
+	// 0 falls back to the default.
+	HookSummaryLines int `json:"hook_summary_lines"`
 	// Backup* control the periodic Cypher dump the daemon writes outside the
 	// Docker volume, so losing the volume does not lose the graph.
 	BackupEnabled       bool   `json:"backup_enabled"`
@@ -50,11 +61,30 @@ func Default() Config {
 		LogFile:               "~/.local/state/infinite-memory/imemd.log",
 		SameProjectBoost:      1.0,
 		RulesK:                50,
+		HookShowRetrieved:     true,
+		HookSummaryLines:      6,
 		BackupEnabled:         true,
 		BackupIntervalHours:   4,
 		BackupKeep:            2,
 		BackupDir:             "~/.local/state/infinite-memory/backups",
 	}
+}
+
+// noLimit is the config value meaning "no cap" for retrieve_k, rules_k and
+// hook_summary_lines. Consumers test for <= 0, so any negative works, but
+// everything written back to a Config is normalized to this.
+const noLimit = -1
+
+// normLimit keeps an explicit no-limit request intact, turns an unset (0)
+// field into the compiled default, and passes real caps through.
+func normLimit(v, def int) int {
+	if v < 0 {
+		return noLimit
+	}
+	if v == 0 {
+		return def
+	}
+	return v
 }
 
 // Load returns Default overlaid with the config file, if one exists.
@@ -70,15 +100,14 @@ func Load() Config {
 		return cfg
 	}
 	_ = json.Unmarshal(data, &cfg)
-	if cfg.RetrieveK <= 0 {
-		cfg.RetrieveK = Default().RetrieveK
-	}
+	cfg.RetrieveK = normLimit(cfg.RetrieveK, Default().RetrieveK)
 	if cfg.DebounceSeconds <= 0 {
 		cfg.DebounceSeconds = Default().DebounceSeconds
 	}
 	if cfg.RulesK < 0 {
-		cfg.RulesK = 0
+		cfg.RulesK = noLimit // any negative means "all of them"; 0 still disables
 	}
+	cfg.HookSummaryLines = normLimit(cfg.HookSummaryLines, Default().HookSummaryLines)
 	if cfg.BackupIntervalHours <= 0 {
 		cfg.BackupIntervalHours = Default().BackupIntervalHours
 	}

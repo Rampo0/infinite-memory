@@ -25,14 +25,28 @@ type Scored struct {
 }
 
 type Retriever struct {
-	Store           *graph.Store
+	Store *graph.Store
+	// K caps the scored memories per prompt; K <= 0 means no cap.
 	K               int
 	MaxContentChars int
 	// SameProjectBoost is added to the score of memories from the current
 	// project so local context wins ties without hiding other projects.
 	SameProjectBoost float64
-	// RulesK caps the always-on standing-rules section (0 disables it).
+	// RulesK caps the always-on standing-rules section: 0 disables the
+	// section, negative means no cap.
 	RulesK int
+	// SummaryLines caps the per-memory lines in the CLI summary; the rest
+	// collapse into a "… N more" line. Negative means no cap.
+	SummaryLines int
+}
+
+// Result is one retrieval: the block injected into the model's context, plus
+// the compact summary and counts shown to the user in the CLI.
+type Result struct {
+	Block    string `json:"block"`
+	Summary  string `json:"summary"`
+	Memories int    `json:"memories"`
+	Rules    int    `json:"rules"`
 }
 
 // Query returns the top-K scored memories for a prompt. Matching is global;
@@ -47,25 +61,28 @@ func (r *Retriever) Query(ctx context.Context, pk, prompt string, now int64) ([]
 		return nil, err
 	}
 	scored := MergeAndScore(q1, q2, q3, now, pk, r.SameProjectBoost)
-	if len(scored) > r.K {
+	if r.K > 0 && len(scored) > r.K {
 		scored = scored[:r.K]
 	}
 	return scored, nil
 }
 
-// Retrieve returns the formatted context block ("" when nothing matched and
-// no rules exist).
-func (r *Retriever) Retrieve(ctx context.Context, pk, prompt string, now int64) (string, int, error) {
+// Retrieve returns the context block plus its user-facing summary. Block is ""
+// when nothing matched and no rules exist.
+func (r *Retriever) Retrieve(ctx context.Context, pk, prompt string, now int64) (Result, error) {
 	scored, err := r.Query(ctx, pk, prompt, now)
 	if err != nil {
-		return "", 0, err
+		return Result{}, err
 	}
 
 	var rules []graph.Candidate
-	if r.RulesK > 0 {
-		all, err := r.Store.Rules(ctx, 100)
+	if r.RulesK != 0 {
+		// Fetch the whole rule pool: the current-project-first ordering and
+		// the RulesK cap both happen in SortRules, so a Cypher-side LIMIT
+		// would truncate before anything is prioritized.
+		all, err := r.Store.Rules(ctx, -1)
 		if err != nil {
-			return "", 0, err
+			return Result{}, err
 		}
 		seen := make(map[string]bool, len(scored))
 		for _, s := range scored {
@@ -75,9 +92,14 @@ func (r *Retriever) Retrieve(ctx context.Context, pk, prompt string, now int64) 
 	}
 
 	if len(scored) == 0 && len(rules) == 0 {
-		return "", 0, nil
+		return Result{}, nil
 	}
-	return FormatBlock(pk, scored, rules, r.MaxContentChars, now), len(scored) + len(rules), nil
+	return Result{
+		Block:    FormatBlock(pk, scored, rules, r.MaxContentChars, now),
+		Summary:  FormatSummary(pk, scored, rules, r.SummaryLines, now),
+		Memories: len(scored),
+		Rules:    len(rules),
+	}, nil
 }
 
 // MergeAndScore merges the three candidate lists by memory id and ranks:
@@ -127,8 +149,8 @@ func MergeAndScore(q1, q2, q3 []graph.Candidate, now int64, pk string, sameProje
 }
 
 // SortRules orders standing rules current-project-first, then by how often
-// they were re-observed and how recently, caps at k and drops ids already
-// shown in the scored section.
+// they were re-observed and how recently, caps at k (k <= 0 means no cap) and
+// drops ids already shown in the scored section.
 func SortRules(rules []graph.Candidate, pk string, k int, exclude map[string]bool) []graph.Candidate {
 	var out []graph.Candidate
 	for _, r := range rules {
@@ -149,7 +171,7 @@ func SortRules(rules []graph.Candidate, pk string, k int, exclude map[string]boo
 		}
 		return out[i].ID < out[j].ID
 	})
-	if len(out) > k {
+	if k > 0 && len(out) > k {
 		out = out[:k]
 	}
 	return out
@@ -186,6 +208,61 @@ func writeLine(b *strings.Builder, m graph.Candidate, pk string, maxContentChars
 		meta += ", from " + filepath.Base(m.ProjectKey)
 	}
 	fmt.Fprintf(b, "- [%s] %s — %s (%s)\n", m.Kind, m.Title, content, meta)
+}
+
+// summaryTitleChars caps the title column of the CLI summary.
+const summaryTitleChars = 48
+
+// FormatSummary renders the compact body shown to the user in the Claude Code
+// CLI: one line per scored memory, standing rules only counted. maxLines caps
+// the memory lines (negative means no cap) and everything left over collapses
+// into a trailing "… N more · M standing rules" line. Returns "" when there
+// is nothing at all.
+func FormatSummary(pk string, mems []Scored, rules []graph.Candidate, maxLines int, now int64) string {
+	if len(mems) == 0 && len(rules) == 0 {
+		return ""
+	}
+	shown := mems
+	if maxLines >= 0 && len(shown) > maxLines {
+		shown = shown[:maxLines]
+	}
+
+	var lines []string
+	for _, m := range shown {
+		from := ""
+		if m.ProjectKey != "" && m.ProjectKey != pk {
+			from = "  ↖" + filepath.Base(m.ProjectKey)
+		}
+		line := fmt.Sprintf("  %-12s %-*s %8s  %5.1f%s",
+			"["+m.Kind+"]", summaryTitleChars, truncRunes(m.Title, summaryTitleChars),
+			relAge(now, m.LastSeen), m.Score, from)
+		lines = append(lines, strings.TrimRight(line, " "))
+	}
+
+	var tail []string
+	if rest := len(mems) - len(shown); rest > 0 {
+		tail = append(tail, fmt.Sprintf("… %d more", rest))
+	}
+	if len(rules) > 0 {
+		tail = append(tail, fmt.Sprintf("%d standing rules", len(rules)))
+	}
+	if len(tail) > 0 {
+		lines = append(lines, "  "+strings.Join(tail, " · "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// truncRunes shortens s to max runes (never mid-rune), ellipsis included.
+func truncRunes(s string, max int) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) <= max || max <= 0 {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+	return strings.TrimRight(string(r[:max-1]), " ") + "…"
 }
 
 func relAge(now, ts int64) string {

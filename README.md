@@ -135,10 +135,13 @@ every escaped statement.
   (2x weight), and 1-hop `RELATED` expansion across ALL projects; scored with recency
   decay (`2·e^(-age/14d)`), a `seen_count` bonus, and a same-project boost
   (`same_project_boost`, default 1.0) so local context wins ties without hiding other
-  repos. Foreign memories carry a `from <project>` marker.
+  repos. Foreign memories carry a `from <project>` marker. Top matches are capped by
+  `retrieve_k` (default 6, `-1` for no cap).
 - **Standing rules**: `rule` memories (coding constitution — LOC limits, max args,
   per-repo patterns, code style, MR templates) are ALWAYS injected, current-project
-  first, capped by `rules_k` (default 3) — independent of keyword match.
+  first, capped by `rules_k` (default 50) — independent of keyword match. The whole
+  rule pool is fetched and prioritized in Go before the cap, so the cap keeps the
+  *best* rules, not an arbitrary slice.
 - **Extraction**: Stop events debounce 45s per session; the worker reads the transcript
   delta since the stored cursor, prompts `claude -p --model claude-haiku-4-5-20251001`
   with `--json-schema` structured output, and MERGEs results into the graph
@@ -146,8 +149,27 @@ every escaped statement.
 - **Recursion guards**: spawned claude runs with `--settings '{"disableAllHooks":true}'`
   and `INFINITE_MEMORY_INTERNAL=1`; every hook subcommand exits instantly when that env
   var is set. `--bare` is deliberately NOT used — it disables subscription OAuth.
-- **Fail-open everywhere**: daemon or Memgraph down → hooks exit 0 silently; the cursor
-  model means missed extractions catch up on the next Stop.
+- **Visible in the CLI**: the `UserPromptSubmit` hook also emits a `systemMessage`, so
+  every prompt prints what memory actually did — one line per injected memory (kind,
+  clipped title, age, score, `↖source-project` when foreign), rules collapsed to a
+  count. The no-match and daemon-down cases print too, because silent memory and dead
+  memory otherwise look identical:
+
+  ```
+  imem: 6 memories + 50 rules (12ms)
+    [fact]       Recursion guard via env sentinel       7d ago    8.4
+    [decision]   Field masks modeled as a domain enum   3h ago    7.1  ↖opening-account
+    … 4 more · 50 standing rules
+
+  imem: no matches — 0 memories, 50 rules (9ms)
+  imem: daemon unreachable — memory off
+  ```
+
+  `hook_show_retrieved: false` restores the old silent behavior;
+  `hook_summary_lines` (default 6, `-1` for no cap) caps the per-memory lines.
+- **Fail-open everywhere**: daemon or Memgraph down → hooks exit 0 silently apart from
+  that one warning line; the cursor model means missed extractions catch up on the
+  next Stop.
 
 ## Ops
 
@@ -166,3 +188,14 @@ make itest                   # integration tests (needs make up)
 
 Config: `~/.config/infinite-memory/config.json` (see `config.example.json`); all fields
 optional.
+
+The three capped knobs share one convention:
+
+| value | `retrieve_k` | `rules_k` | `hook_summary_lines` |
+|---|---|---|---|
+| `-1` (any negative) | no cap — every match | no cap — every rule | no cap — one line per memory |
+| `0` / absent | compiled default (6) | **rules section off** | compiled default (6) |
+| `n > 0` | top n | best n rules | first n lines, rest as "… N more" |
+
+`rules_k` is the odd one out: it is the only section you can switch off, so `0` means
+disabled there rather than "use the default".

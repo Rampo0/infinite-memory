@@ -103,13 +103,37 @@ func hookMain(args []string) {
 		if prompt == "" || strings.HasPrefix(prompt, "/") {
 			return
 		}
+		start := time.Now()
 		resp, err := client.Retrieve(cfg.BaseURL(), client.RetrieveRequest{
 			CWD: in.CWD, Prompt: prompt, SessionID: in.SessionID,
 		}, 2*time.Second)
-		if err != nil || strings.TrimSpace(resp.Context) == "" {
+		ms := time.Since(start).Milliseconds()
+
+		block := ""
+		if err == nil {
+			block = strings.TrimSpace(resp.Context)
+		}
+		// The user-facing line: what went in, or why nothing did. Silent
+		// memory is indistinguishable from dead memory, so both the no-match
+		// and daemon-down cases say so out loud.
+		msg := ""
+		if cfg.HookShowRetrieved {
+			switch {
+			case err != nil:
+				msg = "imem: daemon unreachable — memory off"
+			case resp.Memories == 0:
+				msg = fmt.Sprintf("imem: no matches — 0 memories, %d rules (%dms)", resp.Rules, ms)
+			default:
+				msg = fmt.Sprintf("imem: %d memories + %d rules (%dms)", resp.Memories, resp.Rules, ms)
+				if resp.Summary != "" {
+					msg += "\n" + resp.Summary
+				}
+			}
+		}
+		if block == "" && msg == "" {
 			return
 		}
-		_ = hookio.EmitContext(os.Stdout, "UserPromptSubmit", resp.Context)
+		_ = hookio.EmitContext(os.Stdout, "UserPromptSubmit", block, msg)
 	case "stop":
 		if in.StopHookActive {
 			return

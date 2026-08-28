@@ -20,6 +20,11 @@ type RetrieveRequest struct {
 type RetrieveResponse struct {
 	Context string `json:"context"`
 	Count   int    `json:"count"`
+	// Summary is the compact per-memory listing the hook shows the user;
+	// Memories/Rules split Count so the hook can label both sections.
+	Summary  string `json:"summary"`
+	Memories int    `json:"memories"`
+	Rules    int    `json:"rules"`
 }
 
 type ExtractRequest struct {

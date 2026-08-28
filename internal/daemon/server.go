@@ -62,6 +62,7 @@ func Run(cfg config.Config) error {
 		retr: &retrieve.Retriever{
 			Store: store, K: cfg.RetrieveK, MaxContentChars: cfg.MaxMemoryContentChars,
 			SameProjectBoost: cfg.SameProjectBoost, RulesK: cfg.RulesK,
+			SummaryLines: cfg.HookSummaryLines,
 		},
 		log: log,
 	}
@@ -135,7 +136,7 @@ type retrieveReq struct {
 
 // handleRetrieve always answers 200: failures fail open into empty context.
 func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
-	empty := map[string]any{"context": "", "count": 0}
+	empty := map[string]any{"context": "", "count": 0, "summary": "", "memories": 0, "rules": 0}
 	var req retrieveReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
 		writeJSON(w, http.StatusOK, empty)
@@ -145,14 +146,18 @@ func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RetrieveTO())
 	defer cancel()
 	start := time.Now()
-	block, count, err := s.retr.Retrieve(ctx, pk, req.Prompt, time.Now().Unix())
+	res, err := s.retr.Retrieve(ctx, pk, req.Prompt, time.Now().Unix())
 	if err != nil {
 		s.log.Warn("retrieve failed", "err", err, "project", pk)
 		writeJSON(w, http.StatusOK, empty)
 		return
 	}
-	s.log.Info("retrieve", "project", pk, "count", count, "ms", time.Since(start).Milliseconds())
-	writeJSON(w, http.StatusOK, map[string]any{"context": block, "count": count})
+	s.log.Info("retrieve", "project", pk, "count", res.Memories+res.Rules,
+		"memories", res.Memories, "rules", res.Rules, "ms", time.Since(start).Milliseconds())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"context": res.Block, "count": res.Memories + res.Rules,
+		"summary": res.Summary, "memories": res.Memories, "rules": res.Rules,
+	})
 }
 
 type extractReq struct {

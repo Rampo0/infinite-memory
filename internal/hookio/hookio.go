@@ -39,15 +39,22 @@ type hookSpecificOutput struct {
 }
 
 type contextOutput struct {
-	HookSpecificOutput hookSpecificOutput `json:"hookSpecificOutput"`
+	HookSpecificOutput *hookSpecificOutput `json:"hookSpecificOutput,omitempty"`
+	// SystemMessage is displayed to the user in the Claude Code CLI.
+	SystemMessage string `json:"systemMessage,omitempty"`
 }
 
-// EmitContext writes the additionalContext JSON envelope for the given event.
-func EmitContext(w io.Writer, event, context string) error {
-	return json.NewEncoder(w).Encode(contextOutput{
-		HookSpecificOutput: hookSpecificOutput{
+// EmitContext writes the hook output envelope: context (when non-empty) is
+// injected into the model's context, systemMessage (when non-empty) is shown
+// to the user in the CLI. Either may be empty; both empty writes an empty
+// object, which Claude Code treats as a no-op.
+func EmitContext(w io.Writer, event, context, systemMessage string) error {
+	out := contextOutput{SystemMessage: systemMessage}
+	if context != "" {
+		out.HookSpecificOutput = &hookSpecificOutput{
 			HookEventName:     event,
 			AdditionalContext: context,
-		},
-	})
+		}
+	}
+	return json.NewEncoder(w).Encode(out)
 }

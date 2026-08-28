@@ -95,20 +95,25 @@ func (s *Store) Candidates(ctx context.Context, tokens []string) (q1, q2, q3 []C
 	return q1, q2, q3, nil
 }
 
-// Rules returns all non-superseded kind="rule" memories (standing
-// conventions: LOC limits, code style, MR templates, per-repo patterns).
-// The current-project-first ordering and cap happen in internal/retrieve —
-// the rule population stays small, so fetch-then-sort in Go is fine.
+// Rules returns non-superseded kind="rule" memories (standing conventions:
+// LOC limits, code style, MR templates, per-repo patterns). limit <= 0 fetches
+// all of them, which is the normal call: the query has no ORDER BY, so a
+// Cypher-side LIMIT would pick an arbitrary subset. The current-project-first
+// ordering and the cap happen in internal/retrieve — the rule population stays
+// small, so fetch-then-sort in Go is fine.
 func (s *Store) Rules(ctx context.Context, limit int) ([]Candidate, error) {
 	sess := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
 	defer sess.Close(ctx)
-	q := fmt.Sprintf(`
-MATCH (m:Memory {kind: "rule"})
+	q := `MATCH (m:Memory {kind: "rule"})
 WHERE NOT coalesce(m.superseded, false)
 RETURN m.id AS id, m.title AS title, m.content AS content, m.kind AS kind,
        m.project_key AS pk, m.last_seen_at AS lastSeen, m.seen_count AS seenCount,
-       0 AS hits
-LIMIT %d`, limit)
+       0 AS hits`
+
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+
 	res, err := sess.Run(ctx, q, nil)
 	if err != nil {
 		return nil, err
