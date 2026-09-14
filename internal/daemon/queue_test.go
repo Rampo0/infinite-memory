@@ -99,3 +99,80 @@ func TestQueueFlushUnknownSession(t *testing.T) {
 		t.Fatal("flush without transcript path should error")
 	}
 }
+
+func TestFlushBudgetWithinBudget(t *testing.T) {
+	rec := &recorder{done: make(chan struct{}, 8)}
+	q := newTestQueue(time.Hour, rec)
+	defer q.Stop()
+
+	ok, err := q.FlushBudget(Job{SessionID: "s1", TranscriptPath: "/t"}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("fast job should finish inside the budget")
+	}
+	if rec.count() != 1 {
+		t.Fatalf("want 1 process call, got %d", rec.count())
+	}
+}
+
+func TestFlushBudgetTimesOut(t *testing.T) {
+	released := make(chan struct{})
+	finished := make(chan struct{})
+	q := NewQueue(time.Hour, func(Job) error {
+		<-released
+		close(finished)
+		return nil
+	}, slog.Default())
+	q.Start()
+	defer q.Stop()
+
+	ok, err := q.FlushBudget(Job{SessionID: "s1", TranscriptPath: "/t"}, 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("slow job should report not-done")
+	}
+	// The work must still be running, not cancelled, and must complete.
+	close(released)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("work abandoned after budget expiry; it must finish in the background")
+	}
+}
+
+func TestQueueOnPendingFires(t *testing.T) {
+	rec := &recorder{done: make(chan struct{}, 8)}
+	q := NewQueue(time.Hour, rec.process, slog.Default())
+	var mu sync.Mutex
+	var got []string
+	q.OnPending = func(sid string, dueAt int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if dueAt <= 0 {
+			t.Errorf("dueAt must be a real timestamp, got %d", dueAt)
+		}
+		got = append(got, sid)
+	}
+	q.Start()
+	defer q.Stop()
+
+	q.Notify("stop", Job{SessionID: "s1", TranscriptPath: "/t"})
+	q.Notify("session_end", Job{SessionID: "s2", TranscriptPath: "/t"})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 || got[0] != "s1" || got[1] != "s2" {
+		t.Fatalf("want both branches to fire OnPending, got %v", got)
+	}
+}
+
+func TestQueueNilOnPendingSafe(t *testing.T) {
+	rec := &recorder{done: make(chan struct{}, 8)}
+	q := newTestQueue(time.Hour, rec)
+	defer q.Stop()
+	q.Notify("stop", Job{SessionID: "s1", TranscriptPath: "/t"})
+}

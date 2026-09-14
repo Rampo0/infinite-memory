@@ -39,6 +39,21 @@ type Config struct {
 	// beyond it collapses into a "… N more" line. -1 means no limit;
 	// 0 falls back to the default.
 	HookSummaryLines int `json:"hook_summary_lines"`
+	// HookShowSaved makes the Stop hook and the next UserPromptSubmit print
+	// what the extractor actually wrote — and why it failed, when it did.
+	// Silent save failure is otherwise indistinguishable from a quiet turn.
+	HookShowSaved bool `json:"hook_show_saved"`
+	// HookSavedLines caps the per-memory lines in that block; anything beyond
+	// it collapses into a "… N more" line. -1 means no limit; 0 falls back to
+	// the default.
+	HookSavedLines int `json:"hook_saved_lines"`
+	// HookFlushOnStop makes the Stop hook block on extraction so it can print
+	// what THIS turn saved. False falls back to fire-and-forget: the report
+	// then prints at the next prompt instead.
+	HookFlushOnStop bool `json:"hook_flush_on_stop"`
+	// StopFlushBudgetMS caps how long the daemon holds the flush response
+	// before answering "running" and finishing in the background.
+	StopFlushBudgetMS int `json:"stop_flush_budget_ms"`
 	// Backup* control the periodic Cypher dump the daemon writes outside the
 	// Docker volume, so losing the volume does not lose the graph.
 	BackupEnabled       bool   `json:"backup_enabled"`
@@ -63,6 +78,10 @@ func Default() Config {
 		RulesK:                50,
 		HookShowRetrieved:     true,
 		HookSummaryLines:      6,
+		HookShowSaved:         true,
+		HookSavedLines:        6,
+		HookFlushOnStop:       true,
+		StopFlushBudgetMS:     90000,
 		BackupEnabled:         true,
 		BackupIntervalHours:   4,
 		BackupKeep:            2,
@@ -108,6 +127,10 @@ func Load() Config {
 		cfg.RulesK = noLimit // any negative means "all of them"; 0 still disables
 	}
 	cfg.HookSummaryLines = normLimit(cfg.HookSummaryLines, Default().HookSummaryLines)
+	cfg.HookSavedLines = normLimit(cfg.HookSavedLines, Default().HookSavedLines)
+	if cfg.StopFlushBudgetMS <= 0 {
+		cfg.StopFlushBudgetMS = Default().StopFlushBudgetMS
+	}
 	if cfg.BackupIntervalHours <= 0 {
 		cfg.BackupIntervalHours = Default().BackupIntervalHours
 	}

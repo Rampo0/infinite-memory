@@ -36,6 +36,11 @@ type Queue struct {
 	debounce time.Duration
 	process  func(Job) error
 	log      *slog.Logger
+
+	// OnPending, when set, fires whenever a job is armed or enqueued so the
+	// daemon can tell hooks "extraction is coming in Ns". Set after
+	// construction so NewQueue keeps its signature.
+	OnPending func(sid string, dueAt int64)
 }
 
 type pending struct {
@@ -73,6 +78,7 @@ func (q *Queue) Notify(source string, j Job) {
 		}
 		q.enqueueLocked(p)
 		q.mu.Unlock()
+		q.notifyPending(j.SessionID, time.Now().Unix())
 		return
 	}
 	if p.timer != nil {
@@ -82,6 +88,15 @@ func (q *Queue) Notify(source string, j Job) {
 		p.timer = time.AfterFunc(q.debounce, func() { q.onTimer(sid) })
 	}
 	q.mu.Unlock()
+	q.notifyPending(j.SessionID, time.Now().Add(q.debounce).Unix())
+}
+
+// notifyPending is called with q.mu released: the callback takes the saveLog's
+// own lock, and holding both would couple two unrelated lifetimes.
+func (q *Queue) notifyPending(sid string, dueAt int64) {
+	if q.OnPending != nil {
+		q.OnPending(sid, dueAt)
+	}
 }
 
 // Flush runs the session's job synchronously (verification helper).
@@ -101,6 +116,26 @@ func (q *Queue) Flush(j Job) error {
 		return fmt.Errorf("no transcript_path for session %s", j.SessionID)
 	}
 	return q.runLocked(j)
+}
+
+// FlushBudget runs the session's job synchronously but stops waiting after
+// budget. On timeout the work continues in the background (Process owns its own
+// context, not the request's) and ok is false — the caller should report
+// "running", not an error.
+func (q *Queue) FlushBudget(j Job, budget time.Duration) (ok bool, err error) {
+	done := make(chan error, 1)
+	go func() { done <- q.Flush(j) }()
+	if budget <= 0 {
+		return true, <-done
+	}
+	t := time.NewTimer(budget)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return true, err
+	case <-t.C:
+		return false, nil
+	}
 }
 
 func (q *Queue) onTimer(sid string) {
@@ -198,6 +233,9 @@ type Worker struct {
 	Runner *extract.Runner
 	Cfg    config.Config
 	Log    *slog.Logger
+	// Saves, when set, records each run's outcome so hooks can print it.
+	// Nil-safe, so tests can build a Worker without one.
+	Saves *saveLog
 
 	mu    sync.Mutex
 	fails map[string]int
@@ -215,32 +253,67 @@ func NewWorker(store *graph.Store, cfg config.Config, log *slog.Logger) *Worker 
 
 const minDeltaChars = 200
 
+// Process runs one extraction and records its outcome for the hooks. The work
+// itself lives in process; this wrapper exists so every exit path reports.
 func (w *Worker) Process(j Job) error {
+	start := time.Now()
+	rep, err := w.process(j)
+	if rep.quiet {
+		return err
+	}
+	rep.SessionID = j.SessionID
+	rep.At = time.Now().Unix()
+	rep.DurationMS = time.Since(start).Milliseconds()
+	if err != nil {
+		rep.Error = clipErr(err)
+	}
+	w.Saves.Record(rep)
+	return err
+}
+
+// clipErr reduces an error to one short line: it ends up in a CLI message, not
+// a log file.
+func clipErr(err error) string {
+	s := strings.TrimSpace(err.Error())
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 160 {
+		s = s[:159] + "…"
+	}
+	return s
+}
+
+func (w *Worker) process(j Job) (SaveReport, error) {
+	var rep SaveReport
 	ctx := context.Background()
 	pk := project.ResolveKey(j.CWD)
 	now := time.Now().Unix()
 
 	cur64, err := w.Store.GetCursor(ctx, j.SessionID)
 	if err != nil {
-		return fmt.Errorf("get cursor: %w", err)
+		return rep, fmt.Errorf("get cursor: %w", err)
 	}
 	cur := int(cur64)
 
 	turns, total, err := extract.ReadDelta(j.TranscriptPath, cur, w.Cfg.MaxTranscriptChars)
 	if err != nil {
-		return fmt.Errorf("read transcript: %w", err)
+		return rep, fmt.Errorf("read transcript: %w", err)
 	}
 	if cur > total {
 		w.Log.Warn("cursor beyond transcript, resetting", "session", j.SessionID, "cursor", cur, "lines", total)
 		turns, total, err = extract.ReadDelta(j.TranscriptPath, 0, w.Cfg.MaxTranscriptChars)
 		if err != nil {
-			return fmt.Errorf("read transcript: %w", err)
+			return rep, fmt.Errorf("read transcript: %w", err)
 		}
 	}
 
 	if extract.TotalChars(turns) < minDeltaChars {
+		// Quiet: this fires on nearly every short turn, and a "nothing to
+		// save" line on each would be pure noise.
 		w.Log.Debug("delta too small, skipping spawn", "session", j.SessionID, "lines", total)
-		return w.Store.SetCursor(ctx, j.SessionID, pk, int64(total), now)
+		rep.quiet = true
+		return rep, w.Store.SetCursor(ctx, j.SessionID, pk, int64(total), now)
 	}
 
 	known, err := w.Store.EntityNames(ctx, pk, 20)
@@ -267,16 +340,25 @@ func (w *Worker) Process(j Job) error {
 	w.Log.Info("extracting", "session", j.SessionID, "turns", len(turns), "from_line", cur, "to_line", total, "model", w.Runner.Model)
 	raw, err := w.Runner.Run(spawnCtx, prompt)
 	if err != nil {
-		return w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("claude: %w", err))
+		return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("claude: %w", err))
 	}
 	mems, err := extract.ParseMemories(raw)
 	if err != nil {
-		return w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("parse: %w", err))
+		return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("parse: %w", err))
 	}
 	if len(mems) > 0 {
-		if _, err := w.Store.SaveBatch(ctx, pk, j.SessionID, now, mems); err != nil {
-			return w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("save: %w", err))
+		saved, err := w.Store.SaveBatch(ctx, pk, j.SessionID, now, mems)
+		if err != nil {
+			return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("save: %w", err))
 		}
+		for _, o := range saved {
+			rep.Memories = append(rep.Memories, SavedMemory{
+				Title: o.Title, Kind: o.Kind, New: o.New, Seen: o.Seen,
+			})
+		}
+	}
+	if len(rep.Memories) == 0 {
+		rep.Skipped = "nothing worth saving"
 	}
 
 	w.mu.Lock()
@@ -284,10 +366,10 @@ func (w *Worker) Process(j Job) error {
 	w.mu.Unlock()
 
 	if err := w.Store.SetCursor(ctx, j.SessionID, pk, int64(total), now); err != nil {
-		return fmt.Errorf("set cursor: %w", err)
+		return rep, fmt.Errorf("set cursor: %w", err)
 	}
 	w.Log.Info("extracted", "session", j.SessionID, "memories", len(mems), "cursor", total)
-	return nil
+	return rep, nil
 }
 
 // fail keeps the cursor untouched so the next Stop retries the delta; after

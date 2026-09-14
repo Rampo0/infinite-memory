@@ -23,7 +23,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/Users/ammardwianwari/.claude/local</string>
+        <string>/usr/local/bin:/usr/bin:/bin:/Users/ammardwianwari/.local/bin</string>
     </dict>
 </dict>
 </plist>

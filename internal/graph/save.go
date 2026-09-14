@@ -27,6 +27,17 @@ type MemoryIn struct {
 	Relations [][3]string
 }
 
+// SaveOutcome is one memory's result in a batch. New is false when the content
+// hash already existed and only seen_count advanced — the dedup path, which is
+// worth showing the user.
+type SaveOutcome struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Kind  string `json:"kind"`
+	New   bool   `json:"new"`
+	Seen  int64  `json:"seen"`
+}
+
 // HashContent is the dedup key: same content in the same project collapses
 // into one Memory whose seen_count grows.
 func HashContent(projectKey, content string) string {
@@ -101,15 +112,18 @@ func txRun(ctx context.Context, tx neo4j.ManagedTransaction, cypher string, para
 // SaveBatch writes one extraction batch in a single transaction: project and
 // session upserts, then per memory the MERGE/supersede plus entities,
 // mentions and RELATED co-occurrence edges.
-func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems []MemoryIn) (int, error) {
+func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems []MemoryIn) ([]SaveOutcome, error) {
 	if len(mems) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	sess := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
 	defer sess.Close(ctx)
 
-	saved := 0
+	var saved []SaveOutcome
 	_, err := sess.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		// ExecuteWrite may retry the whole closure, so outcomes reset here
+		// rather than accumulating a duplicate run's worth.
+		saved = saved[:0]
 		base := map[string]any{"pk": pk, "pname": projectName(pk), "sid": sid, "now": now}
 		if err := txRun(ctx, tx, qUpsertProject, base); err != nil {
 			return nil, err
@@ -135,7 +149,8 @@ func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems [
 			if err != nil {
 				return nil, err
 			}
-			created := recInt(rec, "sc") == 1
+			seen := recInt(rec, "sc")
+			created := seen == 1
 			if created {
 				err := txRun(ctx, tx, qSupersede, map[string]any{
 					"pk": pk, "title_lc": titleLC, "kind": m.Kind, "hash": hash,
@@ -209,12 +224,14 @@ func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems [
 					return nil, err
 				}
 			}
-			saved++
+			saved = append(saved, SaveOutcome{
+				ID: hash[:16], Title: m.Title, Kind: m.Kind, New: created, Seen: seen,
+			})
 		}
 		return nil, nil
 	})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	return saved, nil
 }

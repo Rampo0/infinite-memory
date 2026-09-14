@@ -27,6 +27,7 @@ type server struct {
 	store *graph.Store
 	retr  *retrieve.Retriever
 	queue *Queue
+	saves *saveLog
 	log   *slog.Logger
 
 	schemaMu sync.Mutex
@@ -66,8 +67,11 @@ func Run(cfg config.Config) error {
 		},
 		log: log,
 	}
+	s.saves = newSaveLog()
 	worker := NewWorker(store, cfg, log)
+	worker.Saves = s.saves
 	s.queue = NewQueue(cfg.Debounce(), worker.Process, log)
+	s.queue.OnPending = s.saves.MarkPending
 	s.queue.Start()
 
 	if cfg.BackupEnabled {
@@ -86,6 +90,7 @@ func Run(cfg config.Config) error {
 	mux.HandleFunc("GET /v1/entities", s.handleEntities)
 	mux.HandleFunc("GET /v1/entity", s.handleEntity)
 	mux.HandleFunc("GET /v1/stats", s.handleStats)
+	mux.HandleFunc("GET /v1/saved", s.handleSaved)
 	mux.HandleFunc("POST /v1/flush", s.handleFlush)
 	mux.HandleFunc("POST /v1/backup", s.handleBackup)
 	mux.HandleFunc("GET /v1/backups", s.handleBackups)
@@ -142,6 +147,10 @@ func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, empty)
 		return
 	}
+	// Drained once, up front, and attached to EVERY response below: a
+	// Memgraph-down retrieve must not swallow the user's save report.
+	saved := s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
+	empty["saved"] = saved
 	pk := project.ResolveKey(req.CWD)
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RetrieveTO())
 	defer cancel()
@@ -157,6 +166,7 @@ func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"context": res.Block, "count": res.Memories + res.Rules,
 		"summary": res.Summary, "memories": res.Memories, "rules": res.Rules,
+		"saved": saved,
 	})
 }
 
@@ -165,6 +175,9 @@ type extractReq struct {
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
 	Source         string `json:"source"`
+	// BudgetMS is honoured by /v1/flush only: how long to hold the response
+	// before answering "running". 0 means wait as long as it takes.
+	BudgetMS int `json:"budget_ms"`
 }
 
 func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +195,9 @@ func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
 		source = "stop"
 	}
 	s.queue.Notify(source, Job{SessionID: req.SessionID, TranscriptPath: req.TranscriptPath, CWD: req.CWD})
-	w.WriteHeader(http.StatusAccepted)
+	// Notify ran first, so the drain below already sees the new due time.
+	saved := s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
+	writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "saved": saved})
 }
 
 // validTranscriptPath only accepts real files under ~/.claude/projects —
@@ -287,12 +302,42 @@ func (s *server) handleFlush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid transcript_path", http.StatusBadRequest)
 		return
 	}
-	err := s.queue.Flush(Job{SessionID: req.SessionID, TranscriptPath: req.TranscriptPath, CWD: req.CWD})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	budget := time.Duration(req.BudgetMS) * time.Millisecond
+	done, err := s.queue.FlushBudget(
+		Job{SessionID: req.SessionID, TranscriptPath: req.TranscriptPath, CWD: req.CWD}, budget)
+	// Drained AFTER the flush so this run's own report is included. The
+	// error travels inside "saved" with a 200: the hook has to render a
+	// failed extraction, and a 5xx would read as the daemon being down.
+	saved := s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
+	if !done {
+		// Still running: the work owns its own context and finishes in the
+		// background, so its report drains at the next prompt.
+		saved.Status = "running"
+	}
+	if err != nil && saved.Error == "" {
+		saved.Error = clipErr(err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": err == nil, "saved": saved})
+}
+
+// handleSaved is the read-only view of the save log: it never drains, so a
+// debug curl cannot eat the line the user is waiting to see.
+func (s *server) handleSaved(w http.ResponseWriter, r *http.Request) {
+	if sid := r.URL.Query().Get("session_id"); sid != "" {
+		reports, due := s.saves.Peek(sid)
+		if reports == nil {
+			reports = []SaveReport{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"session_id": sid, "reports": reports, "due_in_s": due,
+		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	sessions := s.saves.PeekAll(10)
+	if sessions == nil {
+		sessions = []SaveReport{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
 // handleBackup forces a dump now, on top of the scheduled loop.

@@ -130,6 +130,16 @@ func hookMain(args []string) {
 				}
 			}
 		}
+		// The save side: anything the extractor wrote since the last report,
+		// including runs the Stop hook was too slow to see.
+		if err == nil && cfg.HookShowSaved {
+			if saved := savedMessage(resp.Saved); saved != "" {
+				if msg != "" {
+					msg += "\n"
+				}
+				msg += saved
+			}
+		}
 		if block == "" && msg == "" {
 			return
 		}
@@ -138,14 +148,64 @@ func hookMain(args []string) {
 		if in.StopHookActive {
 			return
 		}
-		_ = client.NotifyExtract(cfg.BaseURL(), client.ExtractRequest{
+		req := client.ExtractRequest{
 			SessionID: in.SessionID, TranscriptPath: in.TranscriptPath, CWD: in.CWD, Source: "stop",
-		}, 500*time.Millisecond)
+		}
+		if cfg.HookFlushOnStop {
+			// Blocking: force extraction now so the line describes THIS turn.
+			// The daemon caps its own wait at BudgetMS and answers "running"
+			// past it, so the extra second here is slack, not a second wait.
+			req.BudgetMS = cfg.StopFlushBudgetMS
+			budget := time.Duration(cfg.StopFlushBudgetMS) * time.Millisecond
+			if resp, err := client.Flush(cfg.BaseURL(), req, budget+3*time.Second); err == nil {
+				if cfg.HookShowSaved {
+					if msg := savedMessage(resp.Saved); msg != "" {
+						// Empty context on purpose: Stop must never inject.
+						_ = hookio.EmitContext(os.Stdout, "Stop", "", msg)
+					}
+				}
+				return
+			}
+			// Daemon unreachable: fall through to the debounce path so the
+			// turn is still saved, just later and silently.
+			req.BudgetMS = 0
+		}
+		_, _ = client.NotifyExtract(cfg.BaseURL(), req, 500*time.Millisecond)
 	case "session-end":
-		_ = client.NotifyExtract(cfg.BaseURL(), client.ExtractRequest{
+		// Still fire-and-forget: the session is over, so nothing would render.
+		_, _ = client.NotifyExtract(cfg.BaseURL(), client.ExtractRequest{
 			SessionID: in.SessionID, TranscriptPath: in.TranscriptPath, CWD: in.CWD, Source: "session_end",
 		}, 500*time.Millisecond)
 	}
+}
+
+// savedMessage renders the save-side counterpart of the retrieve line. Returns
+// "" when there is nothing to say — a silent turn is correct when nothing was
+// extracted and nothing is pending.
+func savedMessage(p client.SavedPayload) string {
+	var msg string
+	switch {
+	case p.Error != "":
+		msg = "imem: save failed — " + p.Error
+	case p.Count > 0:
+		noun := "memories"
+		if p.Count == 1 {
+			noun = "memory"
+		}
+		msg = fmt.Sprintf("imem: saved %d %s (%.1fs)", p.Count, noun, float64(p.MS)/1000)
+	case p.Status == "running":
+		msg = "imem: extracting… (report at next prompt)"
+	case p.Status == "skipped":
+		msg = "imem: saved nothing — no new facts this turn"
+	case p.DueInS > 0:
+		msg = fmt.Sprintf("imem: extracting in %ds", p.DueInS)
+	default:
+		return ""
+	}
+	if p.Summary != "" {
+		msg += "\n" + p.Summary
+	}
+	return msg
 }
 
 func cmdInit() {
@@ -327,6 +387,42 @@ func cmdStatus() {
 			fmt.Printf("  %s: %d memories, %d entities, %d sessions\n", p.Key, p.Memories, p.Entities, p.Sessions)
 		}
 	}
+	// Extraction health: the silent-failure case that is otherwise only
+	// visible by tailing the daemon log.
+	var sv struct {
+		Sessions []struct {
+			SessionID  string `json:"session_id"`
+			At         int64  `json:"at"`
+			DurationMS int64  `json:"duration_ms"`
+			Memories   []struct {
+				Title string `json:"title"`
+			} `json:"memories"`
+			Skipped string `json:"skipped"`
+			Error   string `json:"error"`
+		} `json:"sessions"`
+	}
+	if err := getJSON(cfg.BaseURL()+"/v1/saved", &sv); err == nil {
+		if len(sv.Sessions) == 0 {
+			fmt.Println("extraction: no runs since the daemon started")
+		} else {
+			fmt.Printf("extraction: %d recent session(s)\n", len(sv.Sessions))
+			now := time.Now().Unix()
+			for _, r := range sv.Sessions {
+				sid := r.SessionID
+				if len(sid) > 8 {
+					sid = sid[:8]
+				}
+				switch {
+				case r.Error != "":
+					fmt.Printf("  %s  %-9s FAILED — %s\n", sid, ago(now, r.At), r.Error)
+				case len(r.Memories) > 0:
+					fmt.Printf("  %s  %-9s %d saved (%.1fs)\n", sid, ago(now, r.At), len(r.Memories), float64(r.DurationMS)/1000)
+				default:
+					fmt.Printf("  %s  %-9s nothing saved\n", sid, ago(now, r.At))
+				}
+			}
+		}
+	}
 	var bk struct {
 		IntervalHours int           `json:"interval_hours"`
 		Keep          int           `json:"keep"`
@@ -477,8 +573,11 @@ func cmdHooksJSON() {
 			"UserPromptSubmit": []any{map[string]any{
 				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook user-prompt", "timeout": 5}},
 			}},
+			// Stop must be synchronous: an async hook's stdout is discarded,
+			// which would silently drop the "saved" line. timeout covers the
+			// blocking flush (stop_flush_budget_ms, default 90s) plus slack.
 			"Stop": []any{map[string]any{
-				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook stop", "async": true}},
+				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook stop", "async": false, "timeout": 120}},
 			}},
 			"SessionEnd": []any{map[string]any{
 				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook session-end", "async": true}},
@@ -489,6 +588,7 @@ func cmdHooksJSON() {
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(snippet)
 	fmt.Fprintln(os.Stderr, "\nMerge these entries as ADDITIONAL array elements into ~/.claude/settings.json (keep existing hooks).")
+	fmt.Fprintln(os.Stderr, "Keep Stop synchronous with its timeout: async hooks have their stdout discarded, so the \"saved\" line would never print.")
 }
 
 func getJSON(u string, out any) error {

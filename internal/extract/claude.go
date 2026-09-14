@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/Rampo0/infinite-memory/internal/config"
@@ -71,15 +72,28 @@ func NewRunner(cfg config.Config) *Runner {
 	return &Runner{Bin: cfg.ClaudeBin, Model: cfg.ExtractModel, SpawnDir: cfg.SpawnDir()}
 }
 
+// binFallbacks are tried in order when claude is not on PATH. The daemon
+// inherits launchd's PATH, not your shell's, so a bare "claude" often fails to
+// resolve even though the CLI works fine in a terminal.
+var binFallbacks = []string{
+	"~/.local/bin/claude",    // current installer
+	"~/.claude/local/claude", // legacy installer
+}
+
 func (r *Runner) resolveBin() (string, error) {
 	if p, err := exec.LookPath(r.Bin); err == nil {
 		return p, nil
 	}
-	fallback := config.ExpandHome("~/.claude/local/claude")
-	if _, err := os.Stat(fallback); err == nil {
-		return fallback, nil
+	tried := []string{strconv.Quote(r.Bin)}
+	for _, fb := range binFallbacks {
+		path := config.ExpandHome(fb)
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+		tried = append(tried, strconv.Quote(path))
 	}
-	return "", fmt.Errorf("claude binary not found (tried %q and %q)", r.Bin, fallback)
+	return "", fmt.Errorf("claude binary not found (tried %s) — set claude_bin to an absolute path in config.json",
+		strings.Join(tried, ", "))
 }
 
 // Run executes one extraction and returns the model's raw result text.

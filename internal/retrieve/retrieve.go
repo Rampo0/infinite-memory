@@ -278,3 +278,42 @@ func relAge(now, ts int64) string {
 		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	}
 }
+
+// SavedLine is one memory the extractor wrote. Deliberately minimal: the save
+// side has no score and no age, but the columns line up with FormatSummary so
+// the two blocks stack cleanly in the CLI.
+type SavedLine struct {
+	Title string
+	Kind  string
+	New   bool
+	Seen  int64 // seen_count after the write; shown only when !New
+}
+
+// FormatSaved renders the save-side counterpart of FormatSummary: one line per
+// written memory, with new/seen-again where retrieve shows age and score.
+// maxLines caps the lines (negative means no cap) and the remainder collapses
+// into a trailing "… N more". Returns "" when there is nothing.
+func FormatSaved(lines []SavedLine, maxLines int) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	shown := lines
+	if maxLines >= 0 && len(shown) > maxLines {
+		shown = shown[:maxLines]
+	}
+
+	var out []string
+	for _, l := range shown {
+		state := "new"
+		if !l.New {
+			state = fmt.Sprintf("seen %dx", l.Seen)
+		}
+		line := fmt.Sprintf("  %-12s %-*s  %s",
+			"["+l.Kind+"]", summaryTitleChars, truncRunes(l.Title, summaryTitleChars), state)
+		out = append(out, strings.TrimRight(line, " "))
+	}
+	if rest := len(lines) - len(shown); rest > 0 {
+		out = append(out, fmt.Sprintf("  … %d more", rest))
+	}
+	return strings.Join(out, "\n")
+}

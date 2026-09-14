@@ -70,3 +70,46 @@ func TestLoadMissingFileUsesDefaults(t *testing.T) {
 		t.Fatalf("want default %d, got %d", want, got)
 	}
 }
+
+// hook_saved_lines follows the same -1 / 0 / n convention as its retrieve twin.
+func TestLoadSavedLinesConvention(t *testing.T) {
+	if got := loadWith(t, `{"hook_saved_lines":-1}`).HookSavedLines; got != noLimit {
+		t.Fatalf("-1 must mean no limit, got %d", got)
+	}
+	if got := loadWith(t, `{"hook_saved_lines":-9}`).HookSavedLines; got != noLimit {
+		t.Fatalf("any negative normalizes to noLimit, got %d", got)
+	}
+	if got := loadWith(t, `{"hook_saved_lines":0}`).HookSavedLines; got != Default().HookSavedLines {
+		t.Fatalf("0 must fall back to the default, got %d", got)
+	}
+	if got := loadWith(t, `{"hook_saved_lines":3}`).HookSavedLines; got != 3 {
+		t.Fatalf("a real cap must survive, got %d", got)
+	}
+}
+
+// Both new bools default to true, so an explicit false has to win.
+func TestLoadSaveBoolsCanBeDisabled(t *testing.T) {
+	cfg := loadWith(t, `{"hook_show_saved":false,"hook_flush_on_stop":false}`)
+	if cfg.HookShowSaved {
+		t.Fatal("hook_show_saved:false must survive Load")
+	}
+	if cfg.HookFlushOnStop {
+		t.Fatal("hook_flush_on_stop:false must survive Load")
+	}
+	def := loadWith(t, `{}`)
+	if !def.HookShowSaved || !def.HookFlushOnStop {
+		t.Fatal("both default to true when absent")
+	}
+}
+
+func TestLoadFlushBudgetFallsBack(t *testing.T) {
+	if got := loadWith(t, `{"stop_flush_budget_ms":0}`).StopFlushBudgetMS; got != Default().StopFlushBudgetMS {
+		t.Fatalf("0 must fall back to the default, got %d", got)
+	}
+	if got := loadWith(t, `{"stop_flush_budget_ms":-5}`).StopFlushBudgetMS; got != Default().StopFlushBudgetMS {
+		t.Fatalf("negative is meaningless here, want default, got %d", got)
+	}
+	if got := loadWith(t, `{"stop_flush_budget_ms":15000}`).StopFlushBudgetMS; got != 15000 {
+		t.Fatalf("a real budget must survive, got %d", got)
+	}
+}

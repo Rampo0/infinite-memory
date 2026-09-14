@@ -25,6 +25,21 @@ type RetrieveResponse struct {
 	Summary  string `json:"summary"`
 	Memories int    `json:"memories"`
 	Rules    int    `json:"rules"`
+	// Saved carries whatever the extractor wrote since the last report.
+	Saved SavedPayload `json:"saved"`
+}
+
+// SavedPayload mirrors the daemon's wire shape. Duplicated rather than
+// imported so the hook binary never pulls in the daemon package.
+type SavedPayload struct {
+	Summary string `json:"summary"`
+	Count   int    `json:"count"`
+	New     int    `json:"new"`
+	Batches int    `json:"batches"`
+	MS      int64  `json:"ms"`
+	Status  string `json:"status"` // "" | "running" | "skipped"
+	Error   string `json:"error"`
+	DueInS  int    `json:"due_in_s"`
 }
 
 type ExtractRequest struct {
@@ -32,6 +47,19 @@ type ExtractRequest struct {
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
 	Source         string `json:"source"`
+	// BudgetMS applies to Flush only: how long the daemon may hold the
+	// response before answering "running".
+	BudgetMS int `json:"budget_ms,omitempty"`
+}
+
+type ExtractResponse struct {
+	Queued bool         `json:"queued"`
+	Saved  SavedPayload `json:"saved"`
+}
+
+type FlushResponse struct {
+	OK    bool         `json:"ok"`
+	Saved SavedPayload `json:"saved"`
 }
 
 func post(baseURL, path string, body any, timeout time.Duration, out any) error {
@@ -60,6 +88,17 @@ func Retrieve(baseURL string, req RetrieveRequest, timeout time.Duration) (Retri
 	return out, err
 }
 
-func NotifyExtract(baseURL string, req ExtractRequest, timeout time.Duration) error {
-	return post(baseURL, "/v1/extract", req, timeout, nil)
+func NotifyExtract(baseURL string, req ExtractRequest, timeout time.Duration) (ExtractResponse, error) {
+	var out ExtractResponse
+	err := post(baseURL, "/v1/extract", req, timeout, &out)
+	return out, err
+}
+
+// Flush runs extraction synchronously in the daemon and returns what it wrote.
+// The caller's timeout must exceed req.BudgetMS, or the daemon's "running"
+// answer is lost to a client-side cancel.
+func Flush(baseURL string, req ExtractRequest, timeout time.Duration) (FlushResponse, error) {
+	var out FlushResponse
+	err := post(baseURL, "/v1/flush", req, timeout, &out)
+	return out, err
 }

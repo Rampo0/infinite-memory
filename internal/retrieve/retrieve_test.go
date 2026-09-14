@@ -1,6 +1,7 @@
 package retrieve
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -255,5 +256,75 @@ func TestTruncRunesNeverSplitsRunes(t *testing.T) {
 	}
 	if got := truncRunes("short", 48); got != "short" {
 		t.Fatalf("short titles must pass through, got %q", got)
+	}
+}
+
+func savedFixture(n int) []SavedLine {
+	out := make([]SavedLine, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, SavedLine{
+			Title: fmt.Sprintf("memory number %d", i), Kind: "fact", New: true, Seen: 1,
+		})
+	}
+	return out
+}
+
+func TestFormatSavedEmpty(t *testing.T) {
+	if got := FormatSaved(nil, -1); got != "" {
+		t.Fatalf("want empty, got %q", got)
+	}
+}
+
+func TestFormatSaved(t *testing.T) {
+	got := FormatSaved([]SavedLine{
+		{Title: "Blocking flush at Stop", Kind: "decision", New: true, Seen: 1},
+		{Title: "Formatter mirrors FormatSummary", Kind: "rule", New: false, Seen: 4},
+	}, -1)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %d: %q", len(lines), got)
+	}
+	if !strings.Contains(lines[0], "[decision]") || !strings.HasSuffix(lines[0], "new") {
+		t.Fatalf("new line wrong: %q", lines[0])
+	}
+	if !strings.HasSuffix(lines[1], "seen 4x") {
+		t.Fatalf("reseen line should report the count: %q", lines[1])
+	}
+	for _, l := range lines {
+		if l != strings.TrimRight(l, " ") {
+			t.Fatalf("trailing whitespace in %q", l)
+		}
+	}
+}
+
+func TestFormatSavedClipsTitle(t *testing.T) {
+	long := strings.Repeat("x", summaryTitleChars+20)
+	got := FormatSaved([]SavedLine{{Title: long, Kind: "fact", New: true}}, -1)
+	if !strings.Contains(got, "…") {
+		t.Fatalf("long title should be clipped: %q", got)
+	}
+	if strings.Contains(got, long) {
+		t.Fatal("full title leaked into the line")
+	}
+}
+
+func TestFormatSavedCapsLines(t *testing.T) {
+	got := FormatSaved(savedFixture(5), 2)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want 2 lines + tail, got %d: %q", len(lines), got)
+	}
+	if !strings.Contains(lines[2], "3 more") {
+		t.Fatalf("tail should collapse the rest: %q", lines[2])
+	}
+}
+
+func TestFormatSavedNoLimit(t *testing.T) {
+	got := FormatSaved(savedFixture(5), -1)
+	if n := len(strings.Split(got, "\n")); n != 5 {
+		t.Fatalf("negative cap means every line, got %d", n)
+	}
+	if strings.Contains(got, "more") {
+		t.Fatal("no tail expected when nothing is capped")
 	}
 }

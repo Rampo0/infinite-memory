@@ -68,8 +68,13 @@ func TestSaveAndCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved != 2 {
-		t.Fatalf("want 2 saved, got %d", saved)
+	if len(saved) != 2 {
+		t.Fatalf("want 2 saved, got %d", len(saved))
+	}
+	for _, o := range saved {
+		if !o.New || o.Seen != 1 {
+			t.Fatalf("first write should be new with seen 1, got %+v", o)
+		}
 	}
 
 	q1, q2, _, err := s.Candidates(ctx, []string{"daemon", "port"})
