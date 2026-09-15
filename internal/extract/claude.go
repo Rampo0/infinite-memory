@@ -96,9 +96,41 @@ func (r *Runner) resolveBin() (string, error) {
 		strings.Join(tried, ", "))
 }
 
+// Request is one headless-claude call. A struct rather than positional args
+// so the spawn shape stays readable as callers with different needs appear.
+type Request struct {
+	Prompt       string // stdin — never argv
+	Schema       string // --json-schema; "" disables structured output
+	SystemPrompt string
+	// Append adds to Claude Code's default system prompt instead of replacing
+	// it. Extraction appends (historical behaviour); small single-purpose
+	// calls should replace, since the default prompt is dead weight.
+	Append bool
+	Model  string // "" means r.Model
+	// Isolated adds --safe-mode --strict-mcp-config --setting-sources ""
+	// --tools "". Measured on this machine: input preamble 30K tokens -> 0,
+	// wall 14.4s -> 9.3s, cost $0.016 -> $0.006. It is also a security
+	// control — it removes every configured MCP server from a spawn that
+	// processes untrusted user text.
+	Isolated bool
+	// Effort maps to --effort. Measured on the expansion prompt: "low" cuts
+	// thinking tokens ~25% and wall time ~20%, with no loss in term quality.
+	// "" leaves the account default.
+	Effort string
+}
+
 // Run executes one extraction and returns the model's raw result text.
 // The caller owns the context deadline (120s recommended).
 func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
+	return r.RunSchema(ctx, Request{
+		Prompt: prompt, Schema: ExtractionSchema, SystemPrompt: systemPrompt, Append: true,
+	})
+}
+
+// RunSchema executes one headless claude call and returns its raw result text.
+// Every spawn-hardening decision lives here and nowhere else. The caller owns
+// the context deadline.
+func (r *Runner) RunSchema(ctx context.Context, req Request) (string, error) {
 	bin, err := r.resolveBin()
 	if err != nil {
 		return "", err
@@ -106,22 +138,47 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 	if err := os.MkdirAll(r.SpawnDir, 0o755); err != nil {
 		return "", err
 	}
+	model := req.Model
+	if model == "" {
+		model = r.Model
+	}
 
-	cmd := exec.CommandContext(ctx, bin,
+	args := []string{
 		"-p",
 		"--settings", `{"disableAllHooks": true}`,
 		"--output-format", "json",
-		"--model", r.Model,
+		"--model", model,
 		"--no-session-persistence",
+	}
+	if req.Isolated {
+		// --tools "" strips the tool definitions themselves, which is what
+		// actually removes the preamble; --json-schema keeps working without
+		// them (the result then arrives under "result" rather than
+		// "structured_result", which parseEnvelope already handles).
+		args = append(args, "--safe-mode", "--strict-mcp-config", "--setting-sources", "", "--tools", "")
+	} else {
 		// --json-schema is implemented via a StructuredOutput tool, so that
 		// tool must be allowed; every other tool stays permission-denied in
 		// -p mode (--disallowedTools '*' would break structured output).
-		"--allowedTools", "StructuredOutput",
-		"--json-schema", ExtractionSchema,
-		"--append-system-prompt", systemPrompt,
-	)
+		args = append(args, "--allowedTools", "StructuredOutput")
+	}
+	if req.Effort != "" {
+		args = append(args, "--effort", req.Effort)
+	}
+	if req.Schema != "" {
+		args = append(args, "--json-schema", req.Schema)
+	}
+	if req.SystemPrompt != "" {
+		flag := "--system-prompt"
+		if req.Append {
+			flag = "--append-system-prompt"
+		}
+		args = append(args, flag, req.SystemPrompt)
+	}
+
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = r.SpawnDir
-	cmd.Stdin = strings.NewReader(prompt)
+	cmd.Stdin = strings.NewReader(req.Prompt)
 	cmd.Env = append(os.Environ(), "INFINITE_MEMORY_INTERNAL=1")
 
 	var stdout, stderr bytes.Buffer

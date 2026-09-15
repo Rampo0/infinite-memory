@@ -20,11 +20,11 @@ var validKinds = map[string]bool{
 }
 
 type rawMemory struct {
-	Title     string       `json:"title"`
-	Content   string       `json:"content"`
-	Type      string       `json:"type"`
-	Entities  []rawEntity  `json:"entities"`
-	Relations [][]string   `json:"relations"`
+	Title     string      `json:"title"`
+	Content   string      `json:"content"`
+	Type      string      `json:"type"`
+	Entities  []rawEntity `json:"entities"`
+	Relations [][]string  `json:"relations"`
 }
 
 type rawEntity struct {
@@ -40,17 +40,12 @@ type rawResult struct {
 // stripped, everything outside the outermost braces is discarded, and each
 // item is validated and clipped. LLM output is untrusted input.
 func ParseMemories(raw string) ([]graph.MemoryIn, error) {
-	s := strings.TrimSpace(raw)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start < 0 || end <= start {
-		return nil, fmt.Errorf("no JSON object in output: %s", clip(raw, 200))
+	body, err := SliceJSON(raw)
+	if err != nil {
+		return nil, err
 	}
 	var parsed rawResult
-	if err := json.Unmarshal([]byte(s[start:end+1]), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
 		return nil, fmt.Errorf("unmarshal memories: %w", err)
 	}
 
@@ -93,4 +88,20 @@ func ParseMemories(raw string) ([]graph.MemoryIn, error) {
 		out = append(out, mem)
 	}
 	return out, nil
+}
+
+// SliceJSON strips markdown fences and returns the outermost {...} span of a
+// model response. LLM output is untrusted input: it fences even under a
+// --json-schema, and wraps the object in prose often enough to matter.
+func SliceJSON(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end <= start {
+		return "", fmt.Errorf("no JSON object in output: %s", clip(raw, 200))
+	}
+	return s[start : end+1], nil
 }

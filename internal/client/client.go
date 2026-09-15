@@ -25,6 +25,9 @@ type RetrieveResponse struct {
 	Summary  string `json:"summary"`
 	Memories int    `json:"memories"`
 	Rules    int    `json:"rules"`
+	// Expanded is the pre-rendered query-expansion line, empty when the
+	// expander did not run or added nothing.
+	Expanded string `json:"expanded"`
 	// Saved carries whatever the extractor wrote since the last report.
 	Saved SavedPayload `json:"saved"`
 }

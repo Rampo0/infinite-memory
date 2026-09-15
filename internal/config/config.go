@@ -17,6 +17,19 @@ type Config struct {
 	MemgraphPass string `json:"memgraph_pass"`
 	ClaudeBin    string `json:"claude_bin"`
 	ExtractModel string `json:"extract_model"`
+	// ExpandEnabled turns on the LLM query expander on the retrieval path.
+	// Note the polarity: every other bool here defaults true and relies on
+	// "explicit false wins". This one defaults false and relies on "explicit
+	// true wins" — same unmarshal-over-defaults mechanism, opposite direction,
+	// because expansion adds seconds to every prompt.
+	ExpandEnabled bool `json:"expand_enabled"`
+	// ExpandModel is deliberately separate from ExtractModel: extraction runs
+	// a big model over a whole transcript off the critical path, expansion
+	// runs a small one while the user waits.
+	ExpandModel string `json:"expand_model"`
+	// ExpandBudgetMS caps the expansion spawn. It is spent BEFORE the
+	// RetrieveTimeoutMS graph budget, not inside it.
+	ExpandBudgetMS int `json:"expand_budget_ms"`
 	// RetrieveK caps the keyword/entity-matched memories per prompt.
 	// -1 means no limit; 0 falls back to the default.
 	RetrieveK             int    `json:"retrieve_k"`
@@ -68,6 +81,9 @@ func Default() Config {
 		MemgraphURI:           "bolt://127.0.0.1:7687",
 		ClaudeBin:             "claude",
 		ExtractModel:          "claude-haiku-4-5-20251001",
+		ExpandEnabled:         false,
+		ExpandModel:           "claude-haiku-4-5-20251001",
+		ExpandBudgetMS:        30000,
 		RetrieveK:             6,
 		RetrieveTimeoutMS:     300,
 		DebounceSeconds:       45,
@@ -128,6 +144,12 @@ func Load() Config {
 	}
 	cfg.HookSummaryLines = normLimit(cfg.HookSummaryLines, Default().HookSummaryLines)
 	cfg.HookSavedLines = normLimit(cfg.HookSavedLines, Default().HookSavedLines)
+	if strings.TrimSpace(cfg.ExpandModel) == "" {
+		cfg.ExpandModel = Default().ExpandModel
+	}
+	if cfg.ExpandBudgetMS <= 0 {
+		cfg.ExpandBudgetMS = Default().ExpandBudgetMS
+	}
 	if cfg.StopFlushBudgetMS <= 0 {
 		cfg.StopFlushBudgetMS = Default().StopFlushBudgetMS
 	}
@@ -150,6 +172,16 @@ func (c Config) RetrieveTO() time.Duration {
 		return 300 * time.Millisecond
 	}
 	return time.Duration(c.RetrieveTimeoutMS) * time.Millisecond
+}
+
+// ExpandBudget caps the query-expansion spawn. Sequential with RetrieveTO,
+// never nested inside it: a claude spawn takes seconds, the graph takes
+// milliseconds, and one budget cannot serve both.
+func (c Config) ExpandBudget() time.Duration {
+	if c.ExpandBudgetMS <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(c.ExpandBudgetMS) * time.Millisecond
 }
 
 // SpawnDir is the neutral working directory for extraction claude spawns, so

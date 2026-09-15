@@ -17,9 +17,11 @@ import (
 
 	"github.com/Rampo0/infinite-memory/internal/backup"
 	"github.com/Rampo0/infinite-memory/internal/config"
+	"github.com/Rampo0/infinite-memory/internal/expand"
 	"github.com/Rampo0/infinite-memory/internal/graph"
 	"github.com/Rampo0/infinite-memory/internal/project"
 	"github.com/Rampo0/infinite-memory/internal/retrieve"
+	"github.com/Rampo0/infinite-memory/internal/textutil"
 )
 
 type server struct {
@@ -29,6 +31,11 @@ type server struct {
 	queue *Queue
 	saves *saveLog
 	log   *slog.Logger
+
+	// expander is nil-safe and shared: its vocabulary cache is per-process
+	// state that must not be duplicated per request.
+	expander *expand.Expander
+	vocab    *vocabCache
 
 	schemaMu sync.Mutex
 	schemaOK bool
@@ -68,8 +75,10 @@ func Run(cfg config.Config) error {
 		log: log,
 	}
 	s.saves = newSaveLog()
+	s.vocab = newVocabCache()
 	worker := NewWorker(store, cfg, log)
 	worker.Saves = s.saves
+	s.expander = s.newExpander(worker.Runner)
 	s.queue = NewQueue(cfg.Debounce(), worker.Process, log)
 	s.queue.OnPending = s.saves.MarkPending
 	s.queue.Start()
@@ -87,6 +96,7 @@ func Run(cfg config.Config) error {
 	mux.HandleFunc("POST /v1/retrieve", s.handleRetrieve)
 	mux.HandleFunc("POST /v1/extract", s.handleExtract)
 	mux.HandleFunc("GET /v1/memories", s.handleMemories)
+	mux.HandleFunc("GET /v1/expand", s.handleExpand)
 	mux.HandleFunc("GET /v1/entities", s.handleEntities)
 	mux.HandleFunc("GET /v1/entity", s.handleEntity)
 	mux.HandleFunc("GET /v1/stats", s.handleStats)
@@ -152,21 +162,79 @@ func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	saved := s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
 	empty["saved"] = saved
 	pk := project.ResolveKey(req.CWD)
+	start := time.Now()
+
+	// Expansion spends its own budget first; the graph deadline below is
+	// untouched, so a slow or failed spawn costs time but never correctness.
+	exp := s.expandFor(r.Context(), pk, req.Prompt)
+
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RetrieveTO())
 	defer cancel()
-	start := time.Now()
-	res, err := s.retr.Retrieve(ctx, pk, req.Prompt, time.Now().Unix())
+	retr := *s.retr
+	if len(exp.Added) > 0 {
+		retr.Expand = func(tokens []string) []string { return expand.Merge(tokens, exp.Added) }
+	}
+	res, err := retr.Retrieve(ctx, pk, req.Prompt, time.Now().Unix())
 	if err != nil {
 		s.log.Warn("retrieve failed", "err", err, "project", pk)
 		writeJSON(w, http.StatusOK, empty)
 		return
 	}
 	s.log.Info("retrieve", "project", pk, "count", res.Memories+res.Rules,
-		"memories", res.Memories, "rules", res.Rules, "ms", time.Since(start).Milliseconds())
+		"memories", res.Memories, "rules", res.Rules,
+		"expanded", len(exp.Added), "llm_ms", exp.MS, "ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"context": res.Block, "count": res.Memories + res.Rules,
 		"summary": res.Summary, "memories": res.Memories, "rules": res.Rules,
-		"saved": saved,
+		"saved": saved, "expanded": expandedLine(exp),
+	})
+}
+
+// expandedLine is the pre-rendered user-facing summary of one expansion, so
+// the hook binary stays dumb (same pattern as Result.Summary). Empty when
+// expansion did not run or added nothing.
+func expandedLine(exp expand.Result) string {
+	if exp.TimedOut() {
+		// Never let a timeout read as "the model had nothing to add": one
+		// means raise the budget, the other means the prompt was fine.
+		return fmt.Sprintf("expansion timed out (%dms)", exp.MS)
+	}
+	if exp.Err != nil {
+		return "expansion failed"
+	}
+	if len(exp.Added) == 0 {
+		return ""
+	}
+	line := fmt.Sprintf("+%d expanded", len(exp.Added))
+	if exp.Intent != "" {
+		line += "\n  ↳ " + exp.Intent
+	}
+	return line
+}
+
+// handleExpand shows what the expander would add, without searching. This is
+// the only way to judge an expansion before it starts shaping context.
+func (s *server) handleExpand(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	pk := project.ResolveKey(qv.Get("cwd"))
+	prompt := qv.Get("q")
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ExpandBudget()+time.Second)
+	defer cancel()
+	// Deliberately bypasses cfg.ExpandEnabled: the point of the command is to
+	// evaluate expansion before turning it on.
+	exp := s.expander.Expand(ctx, pk, prompt)
+	added := exp.Added
+	if added == nil {
+		added = []string{}
+	}
+	errMsg := ""
+	if exp.Err != nil {
+		errMsg = exp.Err.Error()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project": pk, "prompt": prompt, "tokens": textutil.Tokenize(prompt, 24),
+		"intent": exp.Intent, "expanded": added, "ms": exp.MS,
+		"model": s.cfg.ExpandModel, "error": errMsg,
 	})
 }
 
@@ -223,11 +291,17 @@ func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(qv.Get("limit")); err == nil && n > 0 && n <= 50 {
 		limit = n
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	// Budget must cover expansion too, or the CLI path times out in exactly
+	// the cases where the hook path succeeds.
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ExpandBudget()+2*time.Second)
 	defer cancel()
+	exp := s.expandFor(ctx, pk, prompt)
 	retr := &retrieve.Retriever{
 		Store: s.store, K: limit, MaxContentChars: s.cfg.MaxMemoryContentChars,
 		SameProjectBoost: s.cfg.SameProjectBoost, RulesK: 0,
+	}
+	if len(exp.Added) > 0 {
+		retr.Expand = func(tokens []string) []string { return expand.Merge(tokens, exp.Added) }
 	}
 	scored, err := retr.Query(ctx, pk, prompt, time.Now().Unix())
 	if err != nil {

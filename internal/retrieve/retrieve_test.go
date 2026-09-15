@@ -328,3 +328,46 @@ func TestFormatSavedNoLimit(t *testing.T) {
 		t.Fatal("no tail expected when nothing is capped")
 	}
 }
+
+// Expand is the only new behaviour on this path: nil must be a perfect no-op
+// (every other test in this file is the regression proof), and a non-nil
+// Expand must reach the token list the queries are built from.
+func TestQueryExpandHook(t *testing.T) {
+	var seen []string
+	r := Retriever{Expand: func(tokens []string) []string {
+		seen = append([]string(nil), tokens...)
+		return append(tokens, "guard insert remisier")
+	}}
+	got := r.expandTokens("solve this issue")
+
+	if len(seen) != 1 || seen[0] != "solve" {
+		t.Fatalf("Expand received %v, want the prompt's own tokens", seen)
+	}
+	if len(got) != 2 || got[1] != "guard insert remisier" {
+		t.Fatalf("got %v, want the expanded term appended", got)
+	}
+}
+
+// A prompt made entirely of stopwords tokenizes to nothing. Rescuing exactly
+// that case is the point, so expansion must run before the empty check.
+func TestQueryExpandRunsOnEmptyTokens(t *testing.T) {
+	called := false
+	r := Retriever{Expand: func(tokens []string) []string {
+		called = true
+		return append(tokens, "rdn creation")
+	}}
+	got := r.expandTokens("the it is of")
+	if !called {
+		t.Fatal("Expand must run even when the prompt tokenizes to nothing")
+	}
+	if len(got) != 1 || got[0] != "rdn creation" {
+		t.Fatalf("got %v, want the expansion to stand alone", got)
+	}
+}
+
+func TestQueryExpandNilIsNoOp(t *testing.T) {
+	r := Retriever{}
+	if got := r.expandTokens("solve this issue"); len(got) != 1 || got[0] != "solve" {
+		t.Fatalf("got %v, want the bare tokens", got)
+	}
+}

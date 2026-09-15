@@ -38,6 +38,11 @@ type Retriever struct {
 	// SummaryLines caps the per-memory lines in the CLI summary; the rest
 	// collapse into a "… N more" line. Negative means no cap.
 	SummaryLines int
+	// Expand appends LLM-derived terms to the prompt's own tokens. Nil means
+	// no expansion — today's behaviour exactly. It takes no context because
+	// the LLM call has already happened by the time Query runs: expansion
+	// spends its own budget in the daemon, before the graph deadline starts.
+	Expand func(tokens []string) []string
 }
 
 // Result is one retrieval: the block injected into the model's context, plus
@@ -52,7 +57,7 @@ type Result struct {
 // Query returns the top-K scored memories for a prompt. Matching is global;
 // pk only drives the same-project boost.
 func (r *Retriever) Query(ctx context.Context, pk, prompt string, now int64) ([]Scored, error) {
-	tokens := textutil.Tokenize(prompt, 24)
+	tokens := r.expandTokens(prompt)
 	if len(tokens) == 0 {
 		return nil, nil
 	}
@@ -100,6 +105,17 @@ func (r *Retriever) Retrieve(ctx context.Context, pk, prompt string, now int64) 
 		Memories: len(scored),
 		Rules:    len(rules),
 	}, nil
+}
+
+// expandTokens is the prompt's own tokens plus whatever the expander added.
+// Expansion runs AFTER tokenizing, not before: a prompt made entirely of
+// stopwords tokenizes to nothing, and rescuing exactly that case is the point.
+func (r *Retriever) expandTokens(prompt string) []string {
+	tokens := textutil.Tokenize(prompt, 24)
+	if r.Expand == nil {
+		return tokens
+	}
+	return r.Expand(tokens)
 }
 
 // MergeAndScore merges the three candidate lists by memory id and ranks:

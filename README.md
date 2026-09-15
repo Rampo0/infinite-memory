@@ -231,3 +231,51 @@ The three capped knobs share one convention:
 
 `rules_k` is the odd one out: it is the only section you can switch off, so `0` means
 disabled there rather than "use the default".
+
+## LLM query expansion (off by default)
+
+The tokenizer drops generic dev vocabulary — `issue`, `problem`, `error`, `fix`, `use`,
+`file`, `code` are all stopwords — so a prompt like `solve this issue` tokenizes to
+`["solve"]` and matches almost nothing. Expansion asks headless `claude` for extra search
+terms in the index's own vocabulary, then appends them to the token list. Nothing else
+changes: the Cypher, the scoring and the graph schema are untouched.
+
+```json
+{ "expand_enabled": true, "expand_model": "claude-haiku-4-5-20251001", "expand_budget_ms": 30000 }
+```
+
+| key | default | meaning |
+|---|---|---|
+| `expand_enabled` | `false` | the kill switch. Note the polarity: every other bool here defaults `true`, this one defaults `false`, because expansion costs real seconds on every prompt. |
+| `expand_model` | `claude-haiku-4-5-20251001` | deliberately separate from `extract_model` — extraction runs a big model off the critical path, expansion runs a small one while you wait. |
+| `expand_budget_ms` | `30000` | spent *before* the `retrieve_timeout_ms` graph budget, never inside it. On expiry you get exactly the unexpanded result. |
+
+Nothing else is tunable. How many terms to return is the model's decision; the structural
+bounds live in the JSON schema the CLI enforces.
+
+**The cost is real and it is not small.** Measured on this machine with `claude-haiku-4-5`,
+the isolated spawn (`--safe-mode --strict-mcp-config --setting-sources "" --tools ""
+--effort low`, which removes a ~30K-token preamble):
+
+| | |
+|---|---|
+| fastest observed | 6.5s |
+| typical | 14-19s |
+| slowest observed | 43s |
+| cost per prompt | ~$0.01 |
+
+Almost all of it is thinking tokens (1,000-5,000 per call), and the spread is wide and
+unpredictable — the same prompt can take 7s or time out. Claude Code renders nothing while
+a `UserPromptSubmit` hook runs, so that shows up as a hang. Try it on the CLI first:
+
+```
+imem expand "solve this issue"       # what would be added, without searching
+```
+
+`imem expand` ignores `expand_enabled` on purpose, so you can judge expansion before you
+turn it on.
+
+**Set `retrieve_k` to a real number before enabling.** With `retrieve_k: -1` a broad
+expansion injects every match into the context block; 30 generic tokens match 442 of 607
+memories in this graph, and the hook's injection has already been silently truncated at
+102.9KB once.

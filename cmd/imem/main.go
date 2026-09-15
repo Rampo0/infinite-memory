@@ -39,6 +39,8 @@ func main() {
 		cmdInit()
 	case "search":
 		cmdSearch(os.Args[2:])
+	case "expand":
+		cmdExpand(os.Args[2:])
 	case "entities":
 		cmdEntities(os.Args[2:])
 	case "entity":
@@ -68,6 +70,7 @@ func usage() {
   imem hook user-prompt|stop|session-end   hook entrypoints (stdin JSON from Claude Code)
   imem init                            ensure Memgraph schema, list indexes/constraints
   imem search "query" [--cwd path]     search memories via the daemon
+  imem expand "prompt" [--cwd path]    show what the LLM expander would add (no search)
   imem entities [--project] [--limit N]    list entities by mention count (global by default)
   imem entity <name...>                one entity: relations + memories mentioning it
   imem backup                          dump the graph now to the backup dir
@@ -104,9 +107,15 @@ func hookMain(args []string) {
 			return
 		}
 		start := time.Now()
+		// The daemon spends the expansion budget before the graph budget, so
+		// the client must outlast both or it cancels work already paid for.
+		timeout := 2 * time.Second
+		if cfg.ExpandEnabled {
+			timeout = cfg.ExpandBudget() + cfg.RetrieveTO() + time.Second
+		}
 		resp, err := client.Retrieve(cfg.BaseURL(), client.RetrieveRequest{
 			CWD: in.CWD, Prompt: prompt, SessionID: in.SessionID,
-		}, 2*time.Second)
+		}, timeout)
 		ms := time.Since(start).Milliseconds()
 
 		block := ""
@@ -122,9 +131,17 @@ func hookMain(args []string) {
 			case err != nil:
 				msg = "imem: daemon unreachable — memory off"
 			case resp.Memories == 0:
+				// Say when expansion ran and still found nothing: otherwise a
+				// slow, fruitless prompt looks identical to a fast one.
 				msg = fmt.Sprintf("imem: no matches — 0 memories, %d rules (%dms)", resp.Rules, ms)
+				if resp.Expanded != "" {
+					msg += " · " + resp.Expanded
+				}
 			default:
 				msg = fmt.Sprintf("imem: %d memories + %d rules (%dms)", resp.Memories, resp.Rules, ms)
+				if resp.Expanded != "" {
+					msg += " · " + resp.Expanded
+				}
 				if resp.Summary != "" {
 					msg += "\n" + resp.Summary
 				}
@@ -269,7 +286,7 @@ func cmdSearch(args []string) {
 			Score   float64 `json:"score"`
 		} `json:"memories"`
 	}
-	if err := getJSON(u, &out); err != nil {
+	if err := getJSON(u, &out, cfg.ExpandBudget()+5*time.Second); err != nil {
 		fmt.Fprintln(os.Stderr, "daemon unreachable:", err)
 		os.Exit(1)
 	}
@@ -559,6 +576,63 @@ func humanBytes(n int64) string {
 	}
 }
 
+func cmdExpand(args []string) {
+	cfg := config.Load()
+	prompt, cwd := "", ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--cwd" && i+1 < len(args) {
+			cwd = args[i+1]
+			i++
+			continue
+		}
+		if prompt == "" {
+			prompt = args[i]
+		}
+	}
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	if prompt == "" {
+		fmt.Fprintln(os.Stderr, `usage: imem expand "prompt" [--cwd path]`)
+		os.Exit(2)
+	}
+	u := cfg.BaseURL() + "/v1/expand?" + url.Values{"cwd": {cwd}, "q": {prompt}}.Encode()
+	var out struct {
+		Project  string   `json:"project"`
+		Tokens   []string `json:"tokens"`
+		Intent   string   `json:"intent"`
+		Expanded []string `json:"expanded"`
+		MS       int64    `json:"ms"`
+		Model    string   `json:"model"`
+		Error    string   `json:"error"`
+	}
+	if err := getJSON(u, &out, cfg.ExpandBudget()+5*time.Second); err != nil {
+		fmt.Fprintln(os.Stderr, "daemon unreachable:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("project:  %s\n", out.Project)
+	fmt.Printf("prompt:   %s\n", prompt)
+	fmt.Printf("tokens:   %s\n", orNone(out.Tokens))
+	if out.Intent != "" {
+		fmt.Printf("intent:   %s\n", out.Intent)
+	}
+	if out.Error != "" {
+		// An expansion that failed and one that legitimately had nothing to
+		// add both print no terms; only this line tells them apart.
+		fmt.Printf("expanded: FAILED — %s\n", out.Error)
+	} else {
+		fmt.Printf("expanded: %s\n", orNone(out.Expanded))
+	}
+	fmt.Printf("%dms (%s)\n", out.MS, out.Model)
+}
+
+func orNone(items []string) string {
+	if len(items) == 0 {
+		return "(none)"
+	}
+	return strings.Join(items, ", ")
+}
+
 func cmdHooksJSON() {
 	exe, err := os.Executable()
 	if err == nil {
@@ -571,7 +645,9 @@ func cmdHooksJSON() {
 	snippet := map[string]any{
 		"hooks": map[string]any{
 			"UserPromptSubmit": []any{map[string]any{
-				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook user-prompt", "timeout": 5}},
+				// Generous because expansion (expand_enabled) spends up to
+				// expand_budget_ms inside this hook before the graph is touched.
+				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook user-prompt", "timeout": 30}},
 			}},
 			// Stop must be synchronous: an async hook's stdout is discarded,
 			// which would silently drop the "saved" line. timeout covers the
@@ -591,8 +667,14 @@ func cmdHooksJSON() {
 	fmt.Fprintln(os.Stderr, "Keep Stop synchronous with its timeout: async hooks have their stdout discarded, so the \"saved\" line would never print.")
 }
 
-func getJSON(u string, out any) error {
-	c := http.Client{Timeout: 3 * time.Second}
+// getJSON defaults to a short timeout; pass one explicitly for endpoints that
+// may spawn claude, where 3s would cancel work the daemon is still doing.
+func getJSON(u string, out any, timeout ...time.Duration) error {
+	d := 3 * time.Second
+	if len(timeout) > 0 {
+		d = timeout[0]
+	}
+	c := http.Client{Timeout: d}
 	resp, err := c.Get(u)
 	if err != nil {
 		return err

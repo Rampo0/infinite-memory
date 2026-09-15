@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func loadWith(t *testing.T, body string) Config {
@@ -111,5 +112,42 @@ func TestLoadFlushBudgetFallsBack(t *testing.T) {
 	}
 	if got := loadWith(t, `{"stop_flush_budget_ms":15000}`).StopFlushBudgetMS; got != 15000 {
 		t.Fatalf("a real budget must survive, got %d", got)
+	}
+}
+
+// expand_enabled inverts this file's usual bool polarity: everything else
+// defaults true and relies on "explicit false wins", this one defaults false
+// and relies on "explicit true wins".
+func TestExpandEnabledPolarity(t *testing.T) {
+	if Default().ExpandEnabled {
+		t.Fatal("expansion must be off unless asked for: it adds seconds to every prompt")
+	}
+	if got := loadWith(t, `{}`); got.ExpandEnabled {
+		t.Fatal("empty config must leave expansion off")
+	}
+	if got := loadWith(t, `{"expand_enabled": true}`); !got.ExpandEnabled {
+		t.Fatal("explicit true must win")
+	}
+}
+
+func TestExpandBudgetFallsBackToDefault(t *testing.T) {
+	for _, body := range []string{`{}`, `{"expand_budget_ms": 0}`, `{"expand_budget_ms": -5}`} {
+		if got := loadWith(t, body).ExpandBudget(); got != 30*time.Second {
+			t.Fatalf("%s -> %v, want the compiled default", body, got)
+		}
+	}
+	if got := loadWith(t, `{"expand_budget_ms": 4000}`).ExpandBudget(); got != 4*time.Second {
+		t.Fatalf("got %v, want 4s", got)
+	}
+}
+
+// Sharing extract_model would drag a large, slow model onto the retrieval path.
+func TestExpandModelIsIndependent(t *testing.T) {
+	got := loadWith(t, `{"extract_model": "claude-opus-5"}`)
+	if got.ExpandModel == got.ExtractModel {
+		t.Fatal("expand_model must not follow extract_model")
+	}
+	if got := loadWith(t, `{"expand_model": ""}`).ExpandModel; got != Default().ExpandModel {
+		t.Fatalf("blank expand_model -> %q, want the default", got)
 	}
 }
