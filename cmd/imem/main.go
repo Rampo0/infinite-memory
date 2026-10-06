@@ -64,6 +64,10 @@ func main() {
 		cmdMigrateRepoKeys(os.Args[2:])
 	case "consolidate":
 		cmdConsolidate(os.Args[2:])
+	case "reindex":
+		cmdReindex(os.Args[2:])
+	case "quota":
+		cmdQuota(os.Args[2:])
 	case "entity":
 		cmdEntity(os.Args[2:])
 	case "backup":
@@ -95,11 +99,13 @@ func usage() {
   imem eval [--file f] [--mode hook|search] [--json]   score retrieval on labelled cases
   imem entities [--project] [--limit N]    list entities by mention count (global by default)
   imem rules [--cwd path] [--limit N]  every live standing rule, this project first, one per line
-  imem consolidate [--plan|--apply] [--limit N] [--min-jaccard F]   merge near-duplicate memories (lists clusters by default)
+  imem consolidate [--plan|--apply] [--limit N] [--min-jaccard F] [--max-usage F]   merge near-duplicate memories (lists clusters by default)
   imem consolidate --archive [--apply]  memories injected 20+ times, never used, unseen 60d+ (archive = out of retrieval)
+  imem quota [--resets]                subscription usage (5-hour / 7-day windows) via one tiny probe
+  imem reindex [--yes]                 recompute keywords and alias-only tokens with today's tokenizer (no LLM)
   imem migrate-repo-keys [--map old=new]... [--yes]   give worktree-keyed memories their repo (additive, dry-run without --yes)
   imem mcp                             MCP server on stdio (imem_search, imem_remember); register with claude mcp add
-  imem backfill-aliases [--limit N] [--batch N] [--workers N] [--yes]   index-time aliases for older memories (dry-run without --yes)
+  imem backfill-aliases [--limit N] [--batch N] [--workers N] [--max-usage F] [--yes]   index-time aliases for older memories (dry-run without --yes)
   imem entity <name...>                one entity: relations + memories mentioning it
   imem backup                          dump the graph now to the backup dir
   imem backups                         list backups (newest first)
@@ -904,6 +910,7 @@ func truncRunesCLI(s string, n int) string {
 func cmdBackfillAliases(args []string) {
 	cfg := config.Load()
 	limit, batch, workers, yes := 0, 10, 6, false
+	maxUsage := 0.0
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--limit", "--batch", "--workers":
@@ -917,6 +924,11 @@ func cmdBackfillAliases(args []string) {
 				case args[i] == "--workers" && n > 0:
 					workers = n
 				}
+				i++
+			}
+		case "--max-usage":
+			if i+1 < len(args) {
+				maxUsage, _ = strconv.ParseFloat(args[i+1], 64)
 				i++
 			}
 		case "--yes":
@@ -957,9 +969,14 @@ func cmdBackfillAliases(args []string) {
 		return
 	}
 
+	gate := newQuotaGate(probeQuota(cfg), maxUsage, time.Now)
+	if gate.stop() {
+		os.Exit(exitQuota)
+	}
 	runner := extract.NewRunner(cfg)
 	b := aliases.Backfiller{
 		Batch: batch,
+		Stop:  gate.stop,
 		Apply: store.SetAliases,
 		Run: func(ctx context.Context, prompt, schema, sys string) (string, error) {
 			ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
@@ -983,8 +1000,11 @@ func cmdBackfillAliases(args []string) {
 		}
 		fmt.Printf("aliased %d/%d (%s)\n", finished, todo, time.Since(start).Round(time.Second))
 	})
-	fmt.Printf("done: %d aliased, %d left pending (re-run to resume)\n", done, failed)
-	if failed > 0 {
+	fmt.Printf("done: %d aliased, %d failed (re-run to resume)\n", done, failed)
+	switch {
+	case gate.stopped():
+		os.Exit(exitQuota)
+	case failed > 0:
 		os.Exit(1)
 	}
 }
@@ -1079,7 +1099,6 @@ func postJSONBody(u string, body, out any) error {
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
-
 
 // cmdMigrateRepoKeys gives memories saved under a worktree path (before
 // project keys resolved worktrees to their repository) a repo_key, so the
@@ -1206,6 +1225,7 @@ func cmdConsolidate(args []string) {
 	cfg := config.Load()
 	plan, apply, archive := false, false, false
 	limit, workers, minJ := 0, 4, cfg.ConsolidateMinJaccard
+	maxUsage := 0.0
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--plan":
@@ -1229,6 +1249,11 @@ func cmdConsolidate(args []string) {
 				if f, err := strconv.ParseFloat(args[i+1], 64); err == nil && f > 0 && f <= 1 {
 					minJ = f
 				}
+				i++
+			}
+		case "--max-usage":
+			if i+1 < len(args) {
+				maxUsage, _ = strconv.ParseFloat(args[i+1], 64)
 				i++
 			}
 		}
@@ -1287,6 +1312,10 @@ func cmdConsolidate(args []string) {
 		return
 	}
 
+	gate := newQuotaGate(probeQuota(cfg), maxUsage, time.Now)
+	if gate.stop() {
+		os.Exit(exitQuota)
+	}
 	runner := extract.NewRunner(cfg)
 	c := consolidate.Consolidator{
 		Run: func(ctx context.Context, prompt, schema, sys string) (string, error) {
@@ -1311,6 +1340,9 @@ func cmdConsolidate(args []string) {
 		go func() {
 			defer wg.Done()
 			for cl := range jobs {
+				if gate.stop() {
+					continue // left for a run after the window resets
+				}
 				ms, err := c.Process(ctx, cl)
 				results <- outcome{cl, ms, err}
 			}
@@ -1348,4 +1380,45 @@ func cmdConsolidate(args []string) {
 		verb = "merged"
 	}
 	fmt.Printf("\n%s %d memories into %d (%d cluster(s) failed)\n", verb, retired, merged, failed)
+	switch {
+	case gate.stopped():
+		os.Exit(exitQuota)
+	case failed > 0:
+		os.Exit(1)
+	}
+}
+
+// cmdReindex recomputes every memory's keywords and alias-only tokens with
+// the current tokenizer — stored lists keep whatever stopwords and caps were
+// in force when the memory was saved. No model is involved.
+func cmdReindex(args []string) {
+	cfg := config.Load()
+	yes := len(args) > 0 && args[0] == "--yes"
+	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "driver:", err)
+		os.Exit(1)
+	}
+	ctx := context.Background()
+	rows, err := store.IndexRows(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "memgraph:", err)
+		os.Exit(1)
+	}
+	changes := graph.ReindexPlan(rows)
+	fmt.Printf("%d memories, %d with stale token lists\n", len(rows), len(changes))
+	if !yes {
+		fmt.Println("re-run with --yes to rewrite them")
+		return
+	}
+	for i, c := range changes {
+		if err := store.SetIndex(ctx, c.ID, c.Keywords, c.AliasOnly); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", c.ID, err)
+			os.Exit(1)
+		}
+		if (i+1)%500 == 0 {
+			fmt.Printf("  %d/%d\n", i+1, len(changes))
+		}
+	}
+	fmt.Printf("reindexed %d\n", len(changes))
 }

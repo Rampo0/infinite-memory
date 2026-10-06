@@ -701,3 +701,29 @@ func TestFormatSavedMarksUpdates(t *testing.T) {
 		t.Fatalf("an update must say it replaced an older memory: %q", out)
 	}
 }
+
+// Alias words are the extractor's guesses, not the memory's own text, and
+// while few memories have them they look artificially rare: "wajib" was an
+// alias on one memory, so a single generic Indonesian word outranked a
+// memory whose own title said "invalid parameter". A term matched only
+// through an alias weighs half.
+func TestAliasOnlyMatchWeighsHalf(t *testing.T) {
+	now := int64(10_000_000)
+	viaAlias := matched(cand("alias", "/p", now, 1, 0), "wajib", "parameter")
+	viaAlias.ViaAlias = []string{"wajib", "parameter"}
+	ownText := matched(cand("text", "/p", now, 1, 0), "invalid", "parameter")
+	q1 := []graph.Candidate{viaAlias, ownText}
+	q1 = append(q1, fillers(19, "parameter", now)...)
+	q1 = append(q1, fillers(30, "invalid", now)[0:30]...)
+	out := MergeAndScore(q1, nil, nil, now, "/p", ScoreOpts{Corpus: 2000})
+	if out[0].ID != "text" {
+		t.Fatalf("a memory's own words must outrank alias guesses, got %q first", out[0].ID)
+	}
+	// Same evidence through its own text weighs full.
+	plain := matched(cand("alias", "/p", now, 1, 0), "wajib", "parameter")
+	full := MergeAndScore(append([]graph.Candidate{plain}, fillers(19, "parameter", now)...), nil, nil, now, "/p", ScoreOpts{Corpus: 2000})
+	half := MergeAndScore(append([]graph.Candidate{viaAlias}, fillers(19, "parameter", now)...), nil, nil, now, "/p", ScoreOpts{Corpus: 2000})
+	if half[0].Score >= full[0].Score {
+		t.Fatal("alias-only terms must weigh less than the same terms in the text")
+	}
+}

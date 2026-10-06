@@ -67,10 +67,12 @@ Rules for output:
   lowercase word (uses, contains, replaces, requires, prefers, runs-on).
 - aliases: 3-10 other words or short phrases a FUTURE prompt would use to ask for this
   memory but that are not already in its title or content — synonyms, the Indonesian
-  and English words for the same thing (prompts are often Indonesian: "lambat"/"lama"
-  for slow, "rekening" for account), acronyms both ways, informal names, and joined or
-  split forms of identifiers ("bca rdn" <-> "bcardn", "getaccount v2" <-> "getaccountv2").
-  Lowercase, at most 40 chars each. Never generic words ("code", "issue", "data").
+  and English words for its TOPIC (prompts are often Indonesian: "rekening" for bank
+  account, "lambat" for a latency problem), acronyms both ways, informal names, and
+  joined or split forms of identifiers ("bca rdn" <-> "bcardn", "getaccount v2" <->
+  "getaccountv2"). Lowercase, at most 40 chars each. Never generic words in any
+  language ("code", "issue", "data") and never translations of generic verbs or
+  adjectives ("wajib", "harus", "gagal", "error"): they match every prompt using them.
 
 Reply with ONLY this JSON object, no markdown fences, no commentary:
 {"memories":[{"title":"...","content":"...","type":"fact|decision|preference|rule|reference","entities":[{"name":"...","type":"technology|component|person|concept|topic|file|other"}],"relations":[["a","rel","b"]],"aliases":["..."]}]}

@@ -186,6 +186,9 @@ func (r *Retriever) expandTokens(prompt string) []string {
 	return r.Expand(tokens)
 }
 
+// aliasWeight scales a term matched only through an alias.
+const aliasWeight = 0.5
+
 // ScoreOpts configures MergeAndScore.
 type ScoreOpts struct {
 	// SameProjectBoost is added to memories of the current project.
@@ -207,7 +210,7 @@ func idf(n, df int) float64 {
 
 // MergeAndScore merges the three candidate lists by memory id and ranks:
 //
-//	direct = Σ idf(keyword) + 2·Σ idf(specific exact entity)
+//	direct = Σ idf(keyword, ½ when only an alias has it) + 2·Σ idf(specific exact entity)
 //	         + Σ idf(single-word entity or partial term, once each)
 //	         (zero direct match discarded)
 //	match  = direct + 0.25·min(related, 4)       (dropped below opts.MinMatch)
@@ -233,15 +236,22 @@ func MergeAndScore(q1, q2, q3 []graph.Candidate, now int64, pk string, o ScoreOp
 			s := byID[c.ID]
 			if s == nil {
 				s = &Scored{Candidate: c}
-				s.Matched, s.Partial = nil, nil
+				s.Matched, s.Partial, s.ViaAlias = nil, nil, nil
 				byID[c.ID] = s
 			}
 			set(s, c)
 		}
 	}
+	viaAlias := map[string]map[string]bool{}
 	absorb(q1, func(s *Scored, c graph.Candidate) {
 		s.Q1 = c.Hits
 		kwTerms[c.ID] = c.Matched
+		if len(c.ViaAlias) > 0 {
+			viaAlias[c.ID] = make(map[string]bool, len(c.ViaAlias))
+			for _, t := range c.ViaAlias {
+				viaAlias[c.ID][t] = true
+			}
+		}
 		for _, t := range c.Matched {
 			dfKW[t]++
 		}
@@ -259,13 +269,21 @@ func MergeAndScore(q1, q2, q3 []graph.Candidate, now int64, pk string, o ScoreOp
 	})
 	absorb(q3, func(s *Scored, c graph.Candidate) { s.Q3 = c.Hits })
 
-	weigh := func(terms []string, hits int64, df map[string]int) float64 {
+	// A keyword term weighs its idf — half when it matched only through an
+	// alias: aliases are the extractor's guesses, and while few memories have
+	// them their words look artificially rare.
+	weighKeywords := func(id string, hits int64) float64 {
+		terms := kwTerms[id]
 		if o.Corpus <= 0 || len(terms) == 0 {
 			return float64(hits)
 		}
 		sum := 0.0
 		for _, t := range terms {
-			sum += idf(o.Corpus, df[t])
+			w := idf(o.Corpus, dfKW[t])
+			if viaAlias[id][t] {
+				w *= aliasWeight
+			}
+			sum += w
 		}
 		return sum
 	}
@@ -308,7 +326,7 @@ func MergeAndScore(q1, q2, q3 []graph.Candidate, now int64, pk string, o ScoreOp
 
 	out := make([]Scored, 0, len(byID))
 	for id, s := range byID {
-		direct := weigh(kwTerms[id], s.Q1, dfKW) + entityWeight(id, s.Q2)
+		direct := weighKeywords(id, s.Q1) + entityWeight(id, s.Q2)
 		if direct == 0 {
 			continue
 		}

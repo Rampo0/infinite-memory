@@ -51,6 +51,7 @@ func init() {
 		"begitu", "gitu", "gini", "begini", "sini", "situ", "sana", "hanya", "cuma",
 		"semua", "sama", "punya", "harus", "perlu", "boleh", "bikin", "hasil",
 		"sendiri", "selesai", "saran", "nah", "oke", "sip", "banget", "bgt", "sangat", "amat",
+		"kendala", "masalah", // issue / problem, stopwords in English too
 	}
 	for _, w := range words {
 		stopwords[w] = struct{}{}

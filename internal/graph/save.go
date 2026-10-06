@@ -74,12 +74,13 @@ const qUpsertMemory = `
 MERGE (m:Memory {hash: $hash})
   ON CREATE SET m.id = $id, m.title = $title, m.title_lc = $title_lc,
                 m.content = $content, m.kind = $kind, m.keywords = $keywords,
-                m.aliases = $aliases,
+                m.aliases = $aliases, m.alias_only = $alias_only,
                 m.project_key = $pk, m.created_at = $now, m.seen_count = 1,
                 m.superseded = false, m.source_session = $sid
   ON MATCH  SET m.seen_count = m.seen_count + 1,
                 m.keywords = coalesce(m.keywords, []) + [k IN $keywords WHERE NOT k IN coalesce(m.keywords, [])],
-                m.aliases = coalesce(m.aliases, []) + [a IN $aliases WHERE NOT a IN coalesce(m.aliases, [])]
+                m.aliases = coalesce(m.aliases, []) + [a IN $aliases WHERE NOT a IN coalesce(m.aliases, [])],
+                m.alias_only = coalesce(m.alias_only, []) + [k IN $alias_only WHERE NOT k IN coalesce(m.alias_only, [])]
 SET m.last_seen_at = $now
 WITH m
 MATCH (p:Project {key: $pk}) MERGE (m)-[:IN_PROJECT]->(p)
@@ -108,9 +109,11 @@ RETURN count(old) AS n`
 const qReobserve = `
 MATCH (m:Memory {id: $target})
 WHERE NOT coalesce(m.superseded, false)
+WITH m, [k IN $toks WHERE NOT k IN coalesce(m.keywords, [])] AS fresh
 SET m.seen_count = m.seen_count + 1, m.last_seen_at = $now,
     m.aliases = coalesce(m.aliases, []) + [a IN $aliases WHERE NOT a IN coalesce(m.aliases, [])],
-    m.keywords = coalesce(m.keywords, []) + [k IN $toks WHERE NOT k IN coalesce(m.keywords, [])]
+    m.keywords = coalesce(m.keywords, []) + fresh,
+    m.alias_only = coalesce(m.alias_only, []) + fresh
 RETURN m.id AS id, m.title AS title, m.kind AS kind, m.seen_count AS sc`
 
 const qUpsertEntity = `
@@ -192,9 +195,10 @@ func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems [
 				"hash": hash, "id": hash[:16],
 				"title": m.Title, "title_lc": titleLC,
 				"content": m.Content, "kind": m.Kind,
-				"keywords": toAny(MemoryKeywords(m)),
-				"aliases":  toAny(m.Aliases),
-				"pk":       pk, "now": now, "sid": sid,
+				"keywords":   toAny(MemoryKeywords(m)),
+				"aliases":    toAny(m.Aliases),
+				"alias_only": toAny(AliasOnly(m)),
+				"pk":         pk, "now": now, "sid": sid,
 			})
 			if err != nil {
 				return nil, err
@@ -316,6 +320,22 @@ func MemoryKeywords(m MemoryIn) []string {
 		}
 	}
 	return kw
+}
+
+// AliasOnly is the alias tokens the memory's own text lacks: what retrieval
+// should treat as the extractor's guess rather than the memory's words.
+func AliasOnly(m MemoryIn) []string {
+	text := map[string]bool{}
+	for _, k := range textutil.Tokenize(m.Title+" "+m.Content, 32) {
+		text[k] = true
+	}
+	var out []string
+	for _, k := range textutil.Tokenize(strings.Join(m.Aliases, " "), 24) {
+		if !text[k] {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 func projectName(pk string) string {

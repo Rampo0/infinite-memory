@@ -291,14 +291,27 @@ service (127.0.0.1:7688, no volume) and the tests refuse `memgraph_uri` unless
 
 ## Maintenance
 
-All three are dry runs until told otherwise, and none deletes anything.
+All of these are dry runs until told otherwise, and none deletes anything.
 
 ```sh
-imem backfill-aliases [--limit N] [--batch 10] [--workers 6] [--yes]
+imem backfill-aliases [--limit N] [--batch 10] [--workers 6] [--max-usage 0.5] [--yes]
 imem migrate-repo-keys [--map old=new]... [--yes]
-imem consolidate [--plan | --apply] [--limit N] [--min-jaccard 0.4]
+imem consolidate [--plan | --apply] [--limit N] [--min-jaccard 0.4] [--max-usage 0.5]
 imem consolidate --archive [--apply]
+imem reindex [--yes]          # recompute keywords / alias-only tokens with today's tokenizer
+imem quota [--resets]         # 5-hour / 7-day subscription usage, via one tiny probe
 ```
+
+**Quota.** Bulk jobs spawn `claude -p` on the same subscription the ai-review and on-call
+agents use, and those agents pause their queues at 60% of the 5-hour window. Run bulk jobs
+with `--max-usage 0.5`: they probe usage at most once a minute, stop before the next spawn
+once the cap is reached (exit code 3; the rest stays pending), and stop if the usage cannot
+be read.
+
+**Alias-only tokens.** Each memory also stores `alias_only`: the alias tokens its own text
+lacks. Retrieval weighs those at half their idf — aliases are the extractor's guesses, and
+while few memories have them their words look artificially rare (a generic "wajib" on one
+memory once outranked a memory whose own title said "invalid parameter").
 
 - **backfill-aliases** gives memories saved before aliases existed (`aliases IS NULL`)
   their aliases: one isolated `expand_model` spawn per batch, batches partitioned across

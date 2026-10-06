@@ -1,10 +1,10 @@
 package aliases
 
 import (
-	"sync"
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -92,7 +92,10 @@ func TestStepSpawnFailureAppliesNothing(t *testing.T) {
 func TestStepNothingLeft(t *testing.T) {
 	fs := &fakeStore{applied: map[string][]string{}}
 	b := Backfiller{Batch: 2, Fetch: fs.fetch, Apply: fs.apply,
-		Run: func(context.Context, string, string, string) (string, error) { t.Fatal("no spawn when nothing is pending"); return "", nil }}
+		Run: func(context.Context, string, string, string) (string, error) {
+			t.Fatal("no spawn when nothing is pending")
+			return "", nil
+		}}
 	if n, err := b.Step(context.Background()); n != 0 || err != nil {
 		t.Fatalf("want 0, nil got %d %v", n, err)
 	}
@@ -133,5 +136,37 @@ func TestBuildPromptAsksForIndonesianWords(t *testing.T) {
 	p := BuildPrompt(items("a1"))
 	if !strings.Contains(p, "at least 2 Indonesian") || !strings.Contains(p, "single distinctive words") {
 		t.Fatalf("the prompt must push for Indonesian terms and single words:\n%s", p)
+	}
+	// "must set" became the alias "wajib", which then matched every on-call
+	// "wajib diisi" ticket: generic words are never aliases, in any language.
+	for _, banned := range []string{`"wajib"`, `"gagal"`, `"harus"`} {
+		if !strings.Contains(p, banned) {
+			t.Fatalf("the prompt must name %s as a forbidden generic alias:\n%s", banned, p)
+		}
+	}
+	if strings.Contains(p, `"gagal" for failed`) || strings.Contains(p, `"kendala" for problem`) {
+		t.Fatal("generic words must not be offered as good alias examples")
+	}
+}
+
+// RunAll stops dispatching batches once Stop says so (the quota cap); the
+// rest stay pending for a later run.
+func TestRunAllHonoursStop(t *testing.T) {
+	all := items("a", "b", "c", "d", "e", "f")
+	var mu sync.Mutex
+	ran := 0
+	b := Backfiller{Batch: 1,
+		Apply: func(context.Context, string, []string) error { return nil },
+		Run: func(context.Context, string, string, string) (string, error) {
+			mu.Lock()
+			ran++
+			mu.Unlock()
+			return `{"items":[]}`, nil
+		},
+		Stop: func() bool { mu.Lock(); defer mu.Unlock(); return ran >= 2 },
+	}
+	done, _ := b.RunAll(context.Background(), all, 1, nil)
+	if done != 2 {
+		t.Fatalf("want 2 batches before the stop, got %d", done)
 	}
 }

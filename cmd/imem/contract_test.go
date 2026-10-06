@@ -50,7 +50,7 @@ func TestMain(m *testing.M) {
 // types, so a JSON shape change on the daemon side also shows up here.
 type fakeDaemon struct {
 	*httptest.Server
-	mu      sync.Mutex
+	mu       sync.Mutex
 	queries  map[string]url.Values
 	calls    map[string]int
 	lastBody map[string]any

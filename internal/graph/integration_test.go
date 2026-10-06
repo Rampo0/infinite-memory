@@ -887,3 +887,77 @@ func TestArchiveTakesMemoriesOutOfRetrieval(t *testing.T) {
 			len(onlyPK(q1, pk)), len(onlyPK(rules, pk)), before, after)
 	}
 }
+
+// alias_only keeps the alias tokens the memory's own text lacks, so retrieval
+// can tell a guess from the memory's words.
+func TestAliasOnlyTokensAreTracked(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-ao", time.Now().UnixNano())
+	now := time.Now().Unix()
+	if _, err := s.SaveBatch(ctx, pk, "sess-ao", now, []MemoryIn{{Title: "Field mask guard zqo",
+		Content: "Empty field mask returns invalid parameter zqo.", Kind: "decision", Aliases: []string{"wajibzq diisizq", "parameter"}}}); err != nil {
+		t.Fatal(err)
+	}
+	via := func(tok string) []string {
+		q1, _, _, err := s.Candidates(ctx, []string{tok}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mine := onlyPK(q1, pk)
+		if len(mine) != 1 {
+			t.Fatalf("%s: want the memory, got %d", tok, len(mine))
+		}
+		return mine[0].ViaAlias
+	}
+	if got := via("wajibzq"); strings.Join(got, ",") != "wajibzq" {
+		t.Fatalf("an alias-only token must be reported as such, got %v", got)
+	}
+	if got := via("parameter"); len(got) != 0 {
+		t.Fatalf("a token in the memory's own text is not alias-only, got %v", got)
+	}
+
+	// Backfill path: SetAliases marks only the new tokens as alias-only.
+	if _, err := s.SaveBatch(ctx, pk, "sess-ao", now, []MemoryIn{{Title: "Old memory zqo2", Content: "Plain field text zqo2.", Kind: "fact"}}); err != nil {
+		t.Fatal(err)
+	}
+	id, _, _ := liveByTitle(t, s, pk, "Old memory zqo2")
+	if err := s.SetAliases(ctx, id, []string{"lambatzq", "field"}); err != nil {
+		t.Fatal(err)
+	}
+	q1, _, _, _ := s.Candidates(ctx, []string{"lambatzq", "field"}, 1)
+	for _, c := range onlyPK(q1, pk) {
+		if c.Title == "Old memory zqo2" && strings.Join(c.ViaAlias, ",") != "lambatzq" {
+			t.Fatalf("backfilled alias-only tokens: want [lambatzq], got %v", c.ViaAlias)
+		}
+	}
+}
+
+func TestReindexRewritesTokenLists(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/reindex-test/%d", time.Now().UnixNano())
+	if _, err := s.SaveBatch(ctx, pk, "sess-ri", time.Now().Unix(), []MemoryIn{{Title: "Reindex me zqr2", Content: "Some text zqr2.", Kind: "fact"}}); err != nil {
+		t.Fatal(err)
+	}
+	all, err := s.IndexRows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row IndexRow
+	for _, r := range all {
+		if r.Title == "Reindex me zqr2" {
+			row = r
+		}
+	}
+	if row.ID == "" || !slices.Contains(row.Keywords, "zqr2") {
+		t.Fatalf("index rows must carry the stored keywords: %+v", row)
+	}
+	if err := s.SetIndex(ctx, row.ID, []string{"fresh", "zqr2"}, []string{"fresh"}); err != nil {
+		t.Fatal(err)
+	}
+	q1, _, _, _ := s.Candidates(ctx, []string{"fresh"}, 1)
+	if len(onlyPK(q1, pk)) != 1 || strings.Join(onlyPK(q1, pk)[0].ViaAlias, ",") != "fresh" {
+		t.Fatalf("reindexed lists must drive retrieval: %+v", onlyPK(q1, pk))
+	}
+}

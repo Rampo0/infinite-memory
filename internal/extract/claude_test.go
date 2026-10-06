@@ -1,8 +1,8 @@
 package extract
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -166,7 +166,7 @@ func TestExtractionSchemaHasBoundedAliases(t *testing.T) {
 
 func TestBuildPromptAsksForAliases(t *testing.T) {
 	p := BuildPrompt("/p", nil, []Turn{{Role: "user", Text: "x"}})
-	for _, want := range []string{"aliases", "Indonesian", `"aliases":[`} {
+	for _, want := range []string{"aliases", "Indonesian", `"aliases":[`, `"wajib"`} {
 		if !strings.Contains(p, want) {
 			t.Fatalf("extraction prompt must ask for aliases (%q missing)", want)
 		}

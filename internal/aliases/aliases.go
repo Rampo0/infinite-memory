@@ -57,15 +57,17 @@ func BuildPrompt(items []Item) string {
 for it that are not already in its title or content. Prompts are often written in
 Indonesian while memories are English, and aliases are matched word by word, so:
 - include at least 2 Indonesian terms whenever a natural Indonesian word exists
-  ("lambat"/"lama" for slow, "rekening" for account, "kendala" for problem,
-  "gagal" for failed, "pengkinian data" for data update);
+  for the memory's TOPIC ("rekening" for bank account, "pengkinian data" for data
+  update, "lambat" for a latency problem);
 - prefer single distinctive words over descriptive phrases;
 - add joined and split forms of identifiers ("bca rdn" <-> "bcardn",
   "getaccount v2" <-> "getaccountv2") and acronyms both ways;
 - synonyms and informal names the user might type.
-Lowercase, at most 40 chars each. Never generic words ("code", "issue", "data",
-"service", "changes", "update"). Return every id, with an empty list when nothing
-would help.
+Lowercase, at most 40 chars each. Never generic words, in any language: not
+"code", "issue", "data", "service", "changes", "update", and never translations of
+generic verbs or adjectives such as "wajib", "harus", "gagal", "error", "baru" —
+they match every prompt that happens to use them. Return every id, with an empty
+list when nothing would help.
 
 Reply as {"items":[{"id":"...","aliases":["..."]}]}.
 
@@ -125,6 +127,9 @@ type Backfiller struct {
 	// Run is one headless claude call returning the raw result text.
 	Run   func(ctx context.Context, prompt, schema, systemPrompt string) (string, error)
 	Batch int
+	// Stop, when set, is asked before every batch RunAll dispatches; true
+	// leaves the remaining batches pending (the quota cap).
+	Stop func() bool
 }
 
 // Step aliases one batch and returns how many memories it finished. Every
@@ -159,6 +164,11 @@ func (b Backfiller) RunAll(ctx context.Context, items []Item, workers int, repor
 		go func() {
 			defer wg.Done()
 			for batch := range batches {
+				// Checked per batch by the worker that would run it, so a
+				// stop takes effect before the next spawn, not one late.
+				if b.Stop != nil && b.Stop() {
+					continue
+				}
 				n, err := b.Process(ctx, batch)
 				mu.Lock()
 				if err != nil {

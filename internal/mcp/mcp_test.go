@@ -122,8 +122,11 @@ func TestSearchToolDefaultsAndCapsLimit(t *testing.T) {
 // model should read why and carry on.
 func TestToolErrorsAreResults(t *testing.T) {
 	s := &Server{
-		Search:   func(context.Context, string, int) (string, error) { return "", errors.New("daemon unreachable") },
-		Remember: func(context.Context, RememberInput) (string, error) { t.Fatal("must not save an invalid memory"); return "", nil },
+		Search: func(context.Context, string, int) (string, error) { return "", errors.New("daemon unreachable") },
+		Remember: func(context.Context, RememberInput) (string, error) {
+			t.Fatal("must not save an invalid memory")
+			return "", nil
+		},
 	}
 	got := serve(t, s, call("imem_search", `{"query":"x"}`), call("imem_remember", `{"title":"","content":"c","kind":"fact"}`),
 		call("imem_remember", `{"title":"t","content":"c","kind":"gossip"}`))

@@ -31,6 +31,9 @@ type Candidate struct {
 	// token of a longer entity name ("imem" in "imem.save"): evidence worth
 	// the term, not the rare entity.
 	Partial []string `json:",omitempty"`
+	// ViaAlias lists keyword-query terms that matched only through the
+	// memory's aliases (the extractor's guesses), not its own text.
+	ViaAlias []string `json:",omitempty"`
 }
 
 // Retrieval is GLOBAL: memories match by topic (keywords/entities) across
@@ -47,6 +50,7 @@ RETURN m.id AS id, m.title AS title, m.content AS content, m.kind AS kind,
        coalesce(m.used_count, 0) AS usedCount, coalesce(m.disputed_count, 0) AS disputedCount,
        coalesce(m.last_used_at, 0) AS lastUsed, coalesce(m.injected_count, 0) AS injectedCount,
        [t IN $tokens WHERE t IN coalesce(m.keywords, [])] AS matched,
+       [t IN $tokens WHERE t IN coalesce(m.alias_only, [])] AS viaAlias,
        size([t IN $tokens WHERE t IN coalesce(m.keywords, [])]) AS hits`
 
 // Entity hits split exact name matches (matched) from terms that only hit a
@@ -114,6 +118,7 @@ func scanCandidates(ctx context.Context, res neo4j.ResultWithContext) ([]Candida
 			LastUsed:      recInt(rec, "lastUsed"),
 			InjectedCount: recInt(rec, "injectedCount"),
 			Partial:       dedupe(recStrs(rec, "partial")),
+			ViaAlias:      recStrs(rec, "viaAlias"),
 		})
 	}
 	return out, res.Err()

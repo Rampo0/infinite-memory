@@ -49,8 +49,10 @@ ORDER BY m.last_seen_at DESC`
 // so the backfilled words are searchable at once.
 func (s *Store) SetAliases(ctx context.Context, id string, aliases []string) error {
 	return s.write(ctx, `MATCH (m:Memory {id: $id})
+WITH m, [k IN $toks WHERE NOT k IN coalesce(m.keywords, [])] AS fresh
 SET m.aliases = $aliases,
-    m.keywords = coalesce(m.keywords, []) + [k IN $toks WHERE NOT k IN coalesce(m.keywords, [])]`,
+    m.keywords = coalesce(m.keywords, []) + fresh,
+    m.alias_only = coalesce(m.alias_only, []) + fresh`,
 		map[string]any{"id": id, "aliases": toAny(aliases),
 			"toks": toAny(textutil.Tokenize(strings.Join(aliases, " "), 24))})
 }
@@ -65,4 +67,73 @@ func (s *Store) write(ctx context.Context, q string, params map[string]any) erro
 	}
 	_, err = res.Consume(ctx)
 	return err
+}
+
+// IndexRow is one memory's text and token lists, for `imem reindex`.
+type IndexRow struct {
+	ID, Title, Content           string
+	Aliases, Keywords, AliasOnly []string
+}
+
+// IndexRows lists every memory with what reindexing needs.
+func (s *Store) IndexRows(ctx context.Context) ([]IndexRow, error) {
+	sess := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer sess.Close(ctx)
+	res, err := sess.Run(ctx, `MATCH (m:Memory)
+RETURN m.id AS id, m.title AS title, m.content AS content, coalesce(m.aliases, []) AS al,
+       coalesce(m.keywords, []) AS kw, coalesce(m.alias_only, []) AS ao`, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []IndexRow
+	for res.Next(ctx) {
+		rec := res.Record()
+		out = append(out, IndexRow{ID: recStr(rec, "id"), Title: recStr(rec, "title"), Content: recStr(rec, "content"),
+			Aliases: recStrs(rec, "al"), Keywords: recStrs(rec, "kw"), AliasOnly: recStrs(rec, "ao")})
+	}
+	return out, res.Err()
+}
+
+// SetIndex replaces a memory's token lists.
+func (s *Store) SetIndex(ctx context.Context, id string, keywords, aliasOnly []string) error {
+	return s.write(ctx, "MATCH (m:Memory {id: $id}) SET m.keywords = $kw, m.alias_only = $ao",
+		map[string]any{"id": id, "kw": toAny(keywords), "ao": toAny(aliasOnly)})
+}
+
+// IndexChange is one memory's recomputed token lists.
+type IndexChange struct {
+	ID                  string
+	Keywords, AliasOnly []string
+}
+
+// ReindexPlan recomputes every row's keywords and alias-only tokens with the
+// current tokenizer (stopwords and caps change over time; stored lists do
+// not) and returns the rows whose lists differ.
+func ReindexPlan(rows []IndexRow) []IndexChange {
+	var out []IndexChange
+	for _, r := range rows {
+		m := MemoryIn{Title: r.Title, Content: r.Content, Aliases: r.Aliases}
+		kw, ao := MemoryKeywords(m), AliasOnly(m)
+		if sameSet(kw, r.Keywords) && sameSet(ao, r.AliasOnly) {
+			continue
+		}
+		out = append(out, IndexChange{ID: r.ID, Keywords: kw, AliasOnly: ao})
+	}
+	return out
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]bool, len(a))
+	for _, x := range a {
+		set[x] = true
+	}
+	for _, x := range b {
+		if !set[x] {
+			return false
+		}
+	}
+	return true
 }
