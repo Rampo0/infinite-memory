@@ -46,9 +46,27 @@ const ExtractionSchema = `{
               "minItems": 3,
               "maxItems": 3
             }
-          }
+          },
+          "aliases": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {"type": "string", "maxLength": 40}
+          },
+          "op": {"type": "string", "enum": ["add", "update", "noop"]},
+          "target_id": {"type": "string"}
         },
         "required": ["title", "content", "type"]
+      }
+    },
+    "feedback": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "verdict": {"type": "string", "enum": ["used", "wrong", "outdated"]}
+        },
+        "required": ["id", "verdict"]
       }
     }
   },
@@ -162,7 +180,9 @@ func (r *Runner) RunSchema(ctx context.Context, req Request) (string, error) {
 		// --json-schema is implemented via a StructuredOutput tool, so that
 		// tool must be allowed; every other tool stays permission-denied in
 		// -p mode (--disallowedTools '*' would break structured output).
-		args = append(args, "--allowedTools", "StructuredOutput")
+		// --strict-mcp-config with no --mcp-config loads no MCP servers: the
+		// user-scope imem server and the rest would boot for nothing.
+		args = append(args, "--allowedTools", "StructuredOutput", "--strict-mcp-config")
 	}
 	if req.Effort != "" {
 		args = append(args, "--effort", req.Effort)

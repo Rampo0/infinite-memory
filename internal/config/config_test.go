@@ -165,3 +165,76 @@ func TestExpandModelIsIndependent(t *testing.T) {
 		t.Fatalf("blank expand_model -> %q, want the default", got)
 	}
 }
+
+// double-shot-latte's continuation judge spawns `claude -p` in this directory
+// with a copy of the conversation: 38% of all retrieves and 265 memories in a
+// fake project before it was ignored by default.
+func TestIgnoredDefaultsToTheJudgeDir(t *testing.T) {
+	cfg := loadWith(t, `{}`)
+	home, _ := os.UserHomeDir()
+	judge := filepath.Join(home, ".claude", "double-shot-latte")
+	if !cfg.Ignored(judge) || !cfg.Ignored(filepath.Join(judge, "sub")) {
+		t.Fatal("the judge dir and anything under it must be ignored")
+	}
+	for _, p := range []string{filepath.Join(home, ".claude"), judge + "-other",
+		filepath.Join(home, ".on-call"), filepath.Join(home, "accountworkspace"), ""} {
+		if cfg.Ignored(p) {
+			t.Fatalf("%q must not be ignored", p)
+		}
+	}
+}
+
+func TestIgnoredFromConfigExpandsHome(t *testing.T) {
+	cfg := loadWith(t, `{"ignore_cwds":["~/sandbox/bots"]}`)
+	home, _ := os.UserHomeDir()
+	if !cfg.Ignored(filepath.Join(home, "sandbox", "bots", "x")) {
+		t.Fatal("a configured root must be expanded and honoured")
+	}
+	if cfg.Ignored(filepath.Join(home, ".claude", "double-shot-latte")) {
+		t.Fatal("a configured list replaces the default, like every other list knob")
+	}
+}
+
+func TestRelevanceDefaults(t *testing.T) {
+	cfg := loadWith(t, `{}`)
+	if cfg.MinMatch != 2.0 || cfg.RelatedMinWeight != 2 {
+		t.Fatalf("want min_match 2.0 and related_min_weight 2, got %v %d", cfg.MinMatch, cfg.RelatedMinWeight)
+	}
+}
+
+// An explicit 0 turns the floor off (explicit wins, as for every knob); a
+// negative value means the same rather than an impossible floor.
+func TestMinMatchExplicitZeroAndNegative(t *testing.T) {
+	if cfg := loadWith(t, `{"min_match":0}`); cfg.MinMatch != 0 {
+		t.Fatalf("explicit 0 must disable the floor, got %v", cfg.MinMatch)
+	}
+	if cfg := loadWith(t, `{"min_match":-3,"related_min_weight":0}`); cfg.MinMatch != 0 || cfg.RelatedMinWeight != 1 {
+		t.Fatalf("negative floor -> 0 and weight < 1 -> 1, got %v %d", cfg.MinMatch, cfg.RelatedMinWeight)
+	}
+}
+
+func TestRetrieveMaxChars(t *testing.T) {
+	if cfg := loadWith(t, `{}`); cfg.RetrieveMaxChars != 6000 {
+		t.Fatalf("default 6000 (under Claude Code's 10,000 inline cap), got %d", cfg.RetrieveMaxChars)
+	}
+	if cfg := loadWith(t, `{"retrieve_max_chars":-5}`); cfg.RetrieveMaxChars != -1 {
+		t.Fatalf("negative means no cap, got %d", cfg.RetrieveMaxChars)
+	}
+}
+
+func TestRulesAtSessionStartDefaults(t *testing.T) {
+	cfg := loadWith(t, `{}`)
+	if !cfg.RulesOnSessionStart || cfg.RulesMaxChars != 8000 {
+		t.Fatalf("want rules at SessionStart within 8000 chars, got %v %d", cfg.RulesOnSessionStart, cfg.RulesMaxChars)
+	}
+	if cfg := loadWith(t, `{"rules_on_session_start":false}`); cfg.RulesOnSessionStart {
+		t.Fatal("explicit false must win")
+	}
+}
+
+func TestConsolidateDefaults(t *testing.T) {
+	cfg := loadWith(t, `{}`)
+	if cfg.ConsolidateEnabled || cfg.ConsolidateIntervalHours != 24 || cfg.ConsolidateMinJaccard != 0.4 {
+		t.Fatalf("consolidation is opt-in, daily, Jaccard 0.4: %v %d %v", cfg.ConsolidateEnabled, cfg.ConsolidateIntervalHours, cfg.ConsolidateMinJaccard)
+	}
+}

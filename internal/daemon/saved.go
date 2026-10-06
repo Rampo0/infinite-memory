@@ -9,10 +9,11 @@ import (
 
 // SavedMemory is one memory a batch wrote, flattened for display.
 type SavedMemory struct {
-	Title string `json:"title"`
-	Kind  string `json:"kind"`
-	New   bool   `json:"new"`
-	Seen  int64  `json:"seen"`
+	Title   string `json:"title"`
+	Kind    string `json:"kind"`
+	New     bool   `json:"new"`
+	Seen    int64  `json:"seen"`
+	Updated bool   `json:"updated,omitempty"`
 }
 
 // SaveReport is the outcome of one extraction run for one session. At most one
@@ -137,7 +138,7 @@ func (l *saveLog) Drain(sid string, maxLines int) SavedPayload {
 		}
 		for _, m := range r.Memories {
 			lines = append(lines, retrieve.SavedLine{
-				Title: m.Title, Kind: m.Kind, New: m.New, Seen: m.Seen,
+				Title: m.Title, Kind: m.Kind, New: m.New, Seen: m.Seen, Updated: m.Updated,
 			})
 			out.Count++
 			if m.New {

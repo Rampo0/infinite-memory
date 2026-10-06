@@ -32,7 +32,19 @@ type Config struct {
 	ExpandBudgetMS int `json:"expand_budget_ms"`
 	// RetrieveK caps the keyword/entity-matched memories per prompt.
 	// -1 means no limit; 0 falls back to the default.
-	RetrieveK             int    `json:"retrieve_k"`
+	RetrieveK int `json:"retrieve_k"`
+	// RetrieveMaxChars caps the block UserPromptSubmit injects. Claude Code
+	// inlines additionalContext only up to 10,000 chars and replaces anything
+	// larger with a 2KB preview, so an uncapped block is mostly invisible.
+	// -1 means no cap; 0 falls back to the default.
+	RetrieveMaxChars int `json:"retrieve_max_chars"`
+	// MinMatch is the hook path's relevance floor: memories whose idf-weighted
+	// match (before recency/project boosts) is below it are not injected.
+	// 0 disables it. imem search never applies it (callers cap at 10).
+	MinMatch float64 `json:"min_match"`
+	// RelatedMinWeight is the minimum RELATED edge weight followed by the
+	// 1-hop query; weight 1 is a single chance co-occurrence.
+	RelatedMinWeight      int    `json:"related_min_weight"`
 	RetrieveTimeoutMS     int    `json:"retrieve_timeout_ms"`
 	DebounceSeconds       int    `json:"debounce_seconds"`
 	MaxTranscriptChars    int    `json:"max_transcript_chars"`
@@ -44,6 +56,14 @@ type Config struct {
 	// RulesK caps the always-injected standing-rules section.
 	// 0 disables the section entirely; -1 means no limit.
 	RulesK int `json:"rules_k"`
+	// RulesOnSessionStart injects standing rules (this project's rules plus
+	// the user's preferences) once per session from the SessionStart hook
+	// instead of on every prompt: they do not change per prompt, and
+	// re-sending them each turn piles duplicates into the context.
+	RulesOnSessionStart bool `json:"rules_on_session_start"`
+	// RulesMaxChars caps that SessionStart block (same 10,000-char inline
+	// cap as retrieve_max_chars). -1 means no cap; 0 falls back to default.
+	RulesMaxChars int `json:"rules_max_chars"`
 	// HookShowRetrieved makes the UserPromptSubmit hook print a compact
 	// summary of what it injected (plus the no-match and daemon-down cases)
 	// into the Claude Code CLI via the hook's systemMessage field.
@@ -73,41 +93,62 @@ type Config struct {
 	// from those transcripts are never saved as rules or preferences: a bot
 	// writes after reading untrusted input, and rules reach every session.
 	AgentRoots []string `json:"agent_roots"`
+	// IgnoreCWDs are directories whose sessions memory never touches: no
+	// retrieve, no extract. For headless spawns that are not conversations —
+	// double-shot-latte's continuation judge runs `claude -p` in its own dir
+	// with a copy of the real conversation, which would otherwise be
+	// re-extracted under a fake project and cost a retrieve per judgement.
+	// Hook-side only: the agents' direct /v1/extract calls are unaffected.
+	IgnoreCWDs []string `json:"ignore_cwds"`
 	// Backup* control the periodic Cypher dump the daemon writes outside the
 	// Docker volume, so losing the volume does not lose the graph.
 	BackupEnabled       bool   `json:"backup_enabled"`
 	BackupIntervalHours int    `json:"backup_interval_hours"`
 	BackupKeep          int    `json:"backup_keep"`
 	BackupDir           string `json:"backup_dir"`
+	// Consolidate* drive the optional daemon loop that merges near-duplicate
+	// memories (same work as `imem consolidate --apply`). Off by default:
+	// review a `--plan` run first.
+	ConsolidateEnabled       bool    `json:"consolidate_enabled"`
+	ConsolidateIntervalHours int     `json:"consolidate_interval_hours"`
+	ConsolidateMinJaccard    float64 `json:"consolidate_min_jaccard"`
 }
 
 func Default() Config {
 	return Config{
-		HTTPAddr:              "127.0.0.1:7690",
-		MemgraphURI:           "bolt://127.0.0.1:7687",
-		ClaudeBin:             "claude",
-		ExtractModel:          "claude-haiku-4-5-20251001",
-		ExpandEnabled:         false,
-		ExpandModel:           "claude-haiku-4-5-20251001",
-		ExpandBudgetMS:        30000,
-		RetrieveK:             6,
-		RetrieveTimeoutMS:     300,
-		DebounceSeconds:       45,
-		MaxTranscriptChars:    24000,
-		MaxMemoryContentChars: 400,
-		LogFile:               "~/.local/state/infinite-memory/imemd.log",
-		SameProjectBoost:      1.0,
-		RulesK:                50,
-		HookShowRetrieved:     true,
-		HookSummaryLines:      6,
-		HookShowSaved:         true,
-		HookSavedLines:        6,
-		HookFlushOnStop:       true,
-		StopFlushBudgetMS:     90000,
-		BackupEnabled:         true,
-		BackupIntervalHours:   4,
-		BackupKeep:            2,
-		BackupDir:             "~/.local/state/infinite-memory/backups",
+		HTTPAddr:                 "127.0.0.1:7690",
+		MemgraphURI:              "bolt://127.0.0.1:7687",
+		ClaudeBin:                "claude",
+		ExtractModel:             "claude-haiku-4-5-20251001",
+		ExpandEnabled:            false,
+		ExpandModel:              "claude-haiku-4-5-20251001",
+		ExpandBudgetMS:           30000,
+		RetrieveK:                6,
+		RetrieveMaxChars:         6000,
+		MinMatch:                 2.0,
+		RelatedMinWeight:         2,
+		RetrieveTimeoutMS:        300,
+		DebounceSeconds:          45,
+		MaxTranscriptChars:       24000,
+		MaxMemoryContentChars:    400,
+		LogFile:                  "~/.local/state/infinite-memory/imemd.log",
+		SameProjectBoost:         1.0,
+		RulesK:                   50,
+		RulesOnSessionStart:      true,
+		RulesMaxChars:            8000,
+		HookShowRetrieved:        true,
+		HookSummaryLines:         6,
+		HookShowSaved:            true,
+		HookSavedLines:           6,
+		HookFlushOnStop:          true,
+		StopFlushBudgetMS:        90000,
+		BackupEnabled:            true,
+		BackupIntervalHours:      4,
+		BackupKeep:               2,
+		BackupDir:                "~/.local/state/infinite-memory/backups",
+		IgnoreCWDs:               []string{"~/.claude/double-shot-latte"},
+		ConsolidateIntervalHours: 24,
+		ConsolidateMinJaccard:    0.4,
 	}
 }
 
@@ -144,7 +185,18 @@ func Load() Config {
 	for i, r := range cfg.AgentRoots {
 		cfg.AgentRoots[i] = ExpandHome(r)
 	}
+	for i, r := range cfg.IgnoreCWDs {
+		cfg.IgnoreCWDs[i] = ExpandHome(r)
+	}
 	cfg.RetrieveK = normLimit(cfg.RetrieveK, Default().RetrieveK)
+	cfg.RetrieveMaxChars = normLimit(cfg.RetrieveMaxChars, Default().RetrieveMaxChars)
+	cfg.RulesMaxChars = normLimit(cfg.RulesMaxChars, Default().RulesMaxChars)
+	if cfg.MinMatch < 0 {
+		cfg.MinMatch = 0
+	}
+	if cfg.RelatedMinWeight < 1 {
+		cfg.RelatedMinWeight = 1
+	}
 	if cfg.DebounceSeconds <= 0 {
 		cfg.DebounceSeconds = Default().DebounceSeconds
 	}
@@ -171,7 +223,28 @@ func Load() Config {
 	if strings.TrimSpace(cfg.BackupDir) == "" {
 		cfg.BackupDir = Default().BackupDir
 	}
+	if cfg.ConsolidateIntervalHours <= 0 {
+		cfg.ConsolidateIntervalHours = Default().ConsolidateIntervalHours
+	}
+	if cfg.ConsolidateMinJaccard <= 0 || cfg.ConsolidateMinJaccard > 1 {
+		cfg.ConsolidateMinJaccard = Default().ConsolidateMinJaccard
+	}
 	return cfg
+}
+
+// Ignored reports whether cwd is, or lies under, an ignore_cwds root.
+func (c Config) Ignored(cwd string) bool {
+	if cwd == "" {
+		return false
+	}
+	clean := filepath.Clean(cwd)
+	for _, root := range c.IgnoreCWDs {
+		r := filepath.Clean(ExpandHome(root))
+		if clean == r || strings.HasPrefix(clean, r+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c Config) BaseURL() string         { return "http://" + c.HTTPAddr }

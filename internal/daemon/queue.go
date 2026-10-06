@@ -12,6 +12,7 @@ import (
 	"github.com/Rampo0/infinite-memory/internal/extract"
 	"github.com/Rampo0/infinite-memory/internal/graph"
 	"github.com/Rampo0/infinite-memory/internal/project"
+	"github.com/Rampo0/infinite-memory/internal/textutil"
 )
 
 type Job struct {
@@ -236,18 +237,26 @@ type Worker struct {
 	// Saves, when set, records each run's outcome so hooks can print it.
 	// Nil-safe, so tests can build a Worker without one.
 	Saves *saveLog
+	// Similar finds existing memories like a transcript excerpt, for the
+	// extractor to reconcile against (B1). Nil skips reconcile.
+	Similar func(ctx context.Context, pk string, tokens []string) ([]extract.Known, error)
+	// Shown lists memories injected into a session since a unix time, for
+	// the extractor to grade (B2). Nil skips feedback.
+	Shown func(sid string, since int64) []extract.Known
 
-	mu    sync.Mutex
-	fails map[string]int
+	mu      sync.Mutex
+	fails   map[string]int
+	lastRun map[string]int64 // per session: start of the last successful run
 }
 
 func NewWorker(store *graph.Store, cfg config.Config, log *slog.Logger) *Worker {
 	return &Worker{
-		Store:  store,
-		Runner: extract.NewRunner(cfg),
-		Cfg:    cfg,
-		Log:    log,
-		fails:  map[string]int{},
+		Store:   store,
+		Runner:  extract.NewRunner(cfg),
+		Cfg:     cfg,
+		Log:     log,
+		fails:   map[string]int{},
+		lastRun: map[string]int64{},
 	}
 }
 
@@ -333,26 +342,40 @@ func (w *Worker) process(j Job) (SaveReport, error) {
 		}
 	}
 
-	prompt := extract.BuildPrompt(pk, known, turns)
-	spawnCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
-
 	// Fails closed: anything not from ~/.claude/projects is an agent's
 	// transcript, even a path that no longer resolves into an agent root since
-	// it was validated. It is extracted isolated and its rules are demoted.
+	// it was validated. It is extracted isolated, its rules are demoted, and
+	// it never reconciles against or grades the user's memories.
 	foreign := !fromClaudeProjects(j.TranscriptPath)
+
+	var pc extract.PromptContext
+	if !foreign {
+		if w.Similar != nil {
+			if sim, err := w.Similar(ctx, pk, deltaTokens(turns)); err == nil {
+				pc.Existing = sim
+			} else {
+				w.Log.Warn("similar memories lookup failed", "err", err)
+			}
+		}
+		if w.Shown != nil {
+			w.mu.Lock()
+			since := w.lastRun[j.SessionID]
+			w.mu.Unlock()
+			pc.Shown = w.Shown(j.SessionID, since)
+		}
+	}
+	prompt := extract.BuildPromptWith(pk, known, turns, pc)
+	spawnCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
 
 	w.Log.Info("extracting", "session", j.SessionID, "turns", len(turns), "from_line", cur, "to_line", total, "model", w.Runner.Model, "isolated", foreign)
 	raw, err := w.Runner.Run(spawnCtx, prompt, foreign)
 	if err != nil {
 		return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("claude: %w", err))
 	}
-	mems, err := extract.ParseMemories(raw)
+	mems, verdicts, err := planExtraction(raw, foreign, knownIDs(pc.Existing), knownIDs(pc.Shown))
 	if err != nil {
 		return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("parse: %w", err))
-	}
-	if foreign {
-		demoteAgentKinds(mems)
 	}
 	if len(mems) > 0 {
 		saved, err := w.Store.SaveBatch(ctx, pk, j.SessionID, now, mems)
@@ -361,8 +384,16 @@ func (w *Worker) process(j Job) (SaveReport, error) {
 		}
 		for _, o := range saved {
 			rep.Memories = append(rep.Memories, SavedMemory{
-				Title: o.Title, Kind: o.Kind, New: o.New, Seen: o.Seen,
+				Title: o.Title, Kind: o.Kind, New: o.New, Seen: o.Seen, Updated: o.Updated,
 			})
+		}
+	}
+	if len(verdicts) > 0 {
+		// Best effort: a lost grade costs ranking, not correctness.
+		if err := w.Store.ApplyFeedback(ctx, now, verdicts); err != nil {
+			w.Log.Warn("feedback not applied", "err", err)
+		} else {
+			w.Log.Info("feedback", "session", j.SessionID, "verdicts", len(verdicts))
 		}
 	}
 	if len(rep.Memories) == 0 {
@@ -371,6 +402,7 @@ func (w *Worker) process(j Job) (SaveReport, error) {
 
 	w.mu.Lock()
 	delete(w.fails, j.SessionID)
+	w.lastRun[j.SessionID] = now
 	w.mu.Unlock()
 
 	if err := w.Store.SetCursor(ctx, j.SessionID, pk, int64(total), now); err != nil {
@@ -399,4 +431,57 @@ func (w *Worker) fail(ctx context.Context, sid, pk string, total int, now int64,
 	}
 	w.Log.Warn("extraction failed, will retry", "session", sid, "attempt", n, "err", cause)
 	return cause
+}
+
+// planExtraction turns the extractor's reply into what to write. Interactive
+// transcripts keep reconcile ops whose target the model was shown, and
+// feedback on memories the assistant was shown. Agent transcripts (foreign)
+// stay add-only with rules and preferences demoted and no feedback: a bot's
+// text may add facts, never retire, reinforce or grade the user's memories.
+func planExtraction(raw string, foreign bool, existing, shown []string) ([]graph.MemoryIn, []graph.Verdict, error) {
+	mems, fb, err := extract.ParseExtraction(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if foreign {
+		mems = extract.ResolveOps(mems, nil)
+		demoteAgentKinds(mems)
+		return mems, nil, nil
+	}
+	mems = extract.ResolveOps(mems, toSet(existing))
+	allowed := toSet(shown)
+	var verdicts []graph.Verdict
+	for _, f := range fb {
+		if allowed[f.ID] {
+			verdicts = append(verdicts, graph.Verdict{ID: f.ID, Verdict: f.Verdict})
+		}
+	}
+	return mems, verdicts, nil
+}
+
+// deltaTokens are the excerpt's search terms, newest turns first: what the
+// extractor will write about is most likely in the latest exchange.
+func deltaTokens(turns []extract.Turn) []string {
+	var b strings.Builder
+	for i := len(turns) - 1; i >= 0; i-- {
+		b.WriteString(turns[i].Text)
+		b.WriteString("\n")
+	}
+	return textutil.Tokenize(b.String(), 300)
+}
+
+func knownIDs(ks []extract.Known) []string {
+	out := make([]string, len(ks))
+	for i, k := range ks {
+		out[i] = k.ID
+	}
+	return out
+}
+
+func toSet(ss []string) map[string]bool {
+	m := make(map[string]bool, len(ss))
+	for _, s := range ss {
+		m[s] = true
+	}
+	return m
 }

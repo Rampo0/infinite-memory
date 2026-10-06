@@ -105,3 +105,24 @@ func Flush(baseURL string, req ExtractRequest, timeout time.Duration) (FlushResp
 	err := post(baseURL, "/v1/flush", req, timeout, &out)
 	return out, err
 }
+
+type SessionStartRequest struct {
+	SessionID string `json:"session_id"`
+	CWD       string `json:"cwd"`
+	// Source is Claude Code's SessionStart source: startup, resume, clear or
+	// compact. The daemon forgets what the session was shown unless resume.
+	Source string `json:"source"`
+}
+
+type SessionStartResponse struct {
+	Context     string `json:"context"`
+	Rules       int    `json:"rules"`
+	Preferences int    `json:"preferences"`
+	Omitted     int    `json:"omitted"`
+}
+
+func SessionStart(baseURL string, req SessionStartRequest, timeout time.Duration) (SessionStartResponse, error) {
+	var out SessionStartResponse
+	err := post(baseURL, "/v1/session-start", req, timeout, &out)
+	return out, err
+}

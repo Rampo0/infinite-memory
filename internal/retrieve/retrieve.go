@@ -43,7 +43,27 @@ type Retriever struct {
 	// the LLM call has already happened by the time Query runs: expansion
 	// spends its own budget in the daemon, before the graph deadline starts.
 	Expand func(tokens []string) []string
+	// Corpus returns the live memory count N for idf weights; nil or <= 0
+	// weighs every hit 1 (the pre-idf behaviour).
+	Corpus func(ctx context.Context) int
+	// MinMatch drops memories whose relevance (idf-weighted hits, before
+	// recency, seen and project boosts) is below it. 0 keeps everything —
+	// the right call for explicit searches, where the caller caps the list.
+	MinMatch float64
+	// RelatedMinWeight is the minimum RELATED edge weight the 1-hop query
+	// follows; <= 1 follows every edge.
+	RelatedMinWeight int
+	// MaxChars caps the injected block (Claude Code inlines additionalContext
+	// only up to 10,000 chars and shows a 2KB preview of anything larger).
+	// <= 0 means no cap.
+	MaxChars int
+	// Exclude drops memories already injected earlier in the session: they
+	// are still in the model's context, so re-sending them wastes budget.
+	Exclude map[string]bool
 }
+
+// promptTokenCap bounds the tokens taken from a prompt.
+const promptTokenCap = 32
 
 // Result is one retrieval: the block injected into the model's context, plus
 // the compact summary and counts shown to the user in the CLI.
@@ -52,20 +72,33 @@ type Result struct {
 	Summary  string `json:"summary"`
 	Memories int    `json:"memories"`
 	Rules    int    `json:"rules"`
+	// Omitted counts matches (memories and rules) left out by MaxChars.
+	Omitted int `json:"omitted"`
+	// Injected are the memories that made it into Block, in order.
+	Injected []Scored `json:"-"`
 }
 
 // Query returns the top-K scored memories for a prompt. Matching is global;
 // pk only drives the same-project boost.
 func (r *Retriever) Query(ctx context.Context, pk, prompt string, now int64) ([]Scored, error) {
-	tokens := r.expandTokens(prompt)
+	return r.QueryTokens(ctx, pk, r.expandTokens(prompt), now)
+}
+
+// QueryTokens is Query over ready-made tokens — the extractor's "existing
+// memories like this excerpt" lookup has a transcript, not a prompt.
+func (r *Retriever) QueryTokens(ctx context.Context, pk string, tokens []string, now int64) ([]Scored, error) {
 	if len(tokens) == 0 {
 		return nil, nil
 	}
-	q1, q2, q3, err := r.Store.Candidates(ctx, tokens)
+	q1, q2, q3, err := r.Store.Candidates(ctx, tokens, r.RelatedMinWeight)
 	if err != nil {
 		return nil, err
 	}
-	scored := MergeAndScore(q1, q2, q3, now, pk, r.SameProjectBoost)
+	opts := ScoreOpts{SameProjectBoost: r.SameProjectBoost, MinMatch: r.MinMatch}
+	if r.Corpus != nil {
+		opts.Corpus = r.Corpus(ctx)
+	}
+	scored := withoutIDs(MergeAndScore(q1, q2, q3, now, pk, opts), r.Exclude)
 	if r.K > 0 && len(scored) > r.K {
 		scored = scored[:r.K]
 	}
@@ -99,60 +132,204 @@ func (r *Retriever) Retrieve(ctx context.Context, pk, prompt string, now int64) 
 	if len(scored) == 0 && len(rules) == 0 {
 		return Result{}, nil
 	}
+	block, shown, shownRules := BuildBlock(pk, scored, rules, r.MaxContentChars, r.MaxChars, now)
+	omitted := len(scored) - len(shown) + len(rules) - len(shownRules)
+	summary := FormatSummary(pk, shown, shownRules, r.SummaryLines, now)
+	if omitted > 0 {
+		summary += fmt.Sprintf("\n  %d more matched, over the %d-char budget", omitted, r.MaxChars)
+	}
 	return Result{
-		Block:    FormatBlock(pk, scored, rules, r.MaxContentChars, now),
-		Summary:  FormatSummary(pk, scored, rules, r.SummaryLines, now),
-		Memories: len(scored),
-		Rules:    len(rules),
+		Block:    block,
+		Summary:  summary,
+		Memories: len(shown),
+		Rules:    len(shownRules),
+		Omitted:  omitted,
+		Injected: shown,
 	}, nil
+}
+
+// uniq drops repeated strings, keeping first occurrences in order.
+func uniq(ss []string) []string {
+	seen := make(map[string]bool, len(ss))
+	out := ss[:0]
+	for _, s := range ss {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// withoutIDs drops memories whose id is in exclude, keeping order.
+func withoutIDs(scored []Scored, exclude map[string]bool) []Scored {
+	if len(exclude) == 0 {
+		return scored
+	}
+	out := scored[:0:0]
+	for _, s := range scored {
+		if !exclude[s.ID] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // expandTokens is the prompt's own tokens plus whatever the expander added.
 // Expansion runs AFTER tokenizing, not before: a prompt made entirely of
 // stopwords tokenizes to nothing, and rescuing exactly that case is the point.
 func (r *Retriever) expandTokens(prompt string) []string {
-	tokens := textutil.Tokenize(prompt, 24)
+	tokens := textutil.Tokenize(prompt, promptTokenCap)
 	if r.Expand == nil {
 		return tokens
 	}
 	return r.Expand(tokens)
 }
 
+// ScoreOpts configures MergeAndScore.
+type ScoreOpts struct {
+	// SameProjectBoost is added to memories of the current project.
+	SameProjectBoost float64
+	// Corpus is the live memory count N; <= 0 weighs every hit 1.
+	Corpus int
+	// MinMatch is the relevance floor, applied before any boost; 0 = none.
+	MinMatch float64
+}
+
+// idf is the BM25 inverse document frequency: a term in one memory of 2000
+// weighs ~7.2, one in a quarter of them ~1.4. Always positive.
+func idf(n, df int) float64 {
+	if df < 1 {
+		df = 1
+	}
+	return math.Log(1 + (float64(n)-float64(df)+0.5)/(float64(df)+0.5))
+}
+
 // MergeAndScore merges the three candidate lists by memory id and ranks:
 //
-//	match = 1.0*q1 + 2.0*q2 + 0.75*min(q3, 4)   (zero-match discarded)
-//	score = match + 2.0*exp(-ageDays/14) + 0.3*ln(1+seen_count)
-//	      + sameProjectBoost when the memory belongs to pk
-func MergeAndScore(q1, q2, q3 []graph.Candidate, now int64, pk string, sameProjectBoost float64) []Scored {
+//	direct = Σ idf(keyword) + 2·Σ idf(specific exact entity)
+//	         + Σ idf(single-word entity or partial term, once each)
+//	         (zero direct match discarded)
+//	match  = direct + 0.25·min(related, 4)       (dropped below opts.MinMatch)
+//	score  = match + 2.0·exp(-ageDays/14) + 0.3·ln(1+seen_count)
+//	       + 0.4·ln(1+used_count) - 1.0·min(disputed_count, 3)
+//	       + opts.SameProjectBoost when the memory belongs to pk
+//
+// ageDays counts from the later of last seen and last used. Feedback only
+// re-ranks: the relevance floor is applied to match, before any of it.
+//
+// Document frequencies come from the candidate rows themselves: the keyword
+// and entity queries return every memory matching any term, so counting rows
+// per term is exact. RELATED hits only re-rank direct matches — on their own
+// they once pulled 1020 memories into a single prompt. Without a corpus size
+// or matched lists, each hit weighs 1 (the pre-idf formula).
+func MergeAndScore(q1, q2, q3 []graph.Candidate, now int64, pk string, o ScoreOpts) []Scored {
 	byID := map[string]*Scored{}
-	absorb := func(cands []graph.Candidate, set func(s *Scored, hits int64)) {
+	kwTerms := map[string][]string{}
+	entTerms, partTerms := map[string][]string{}, map[string][]string{}
+	dfKW, dfEnt, dfPart := map[string]int{}, map[string]int{}, map[string]int{}
+	absorb := func(cands []graph.Candidate, set func(s *Scored, c graph.Candidate)) {
 		for _, c := range cands {
 			s := byID[c.ID]
 			if s == nil {
 				s = &Scored{Candidate: c}
+				s.Matched, s.Partial = nil, nil
 				byID[c.ID] = s
 			}
-			set(s, c.Hits)
+			set(s, c)
 		}
 	}
-	absorb(q1, func(s *Scored, h int64) { s.Q1 = h })
-	absorb(q2, func(s *Scored, h int64) { s.Q2 = h })
-	absorb(q3, func(s *Scored, h int64) { s.Q3 = h })
+	absorb(q1, func(s *Scored, c graph.Candidate) {
+		s.Q1 = c.Hits
+		kwTerms[c.ID] = c.Matched
+		for _, t := range c.Matched {
+			dfKW[t]++
+		}
+	})
+	absorb(q2, func(s *Scored, c graph.Candidate) {
+		s.Q2 = c.Hits
+		entTerms[c.ID] = c.Matched
+		partTerms[c.ID] = c.Partial
+		for _, e := range c.Matched {
+			dfEnt[e]++
+		}
+		for _, t := range c.Partial {
+			dfPart[t]++
+		}
+	})
+	absorb(q3, func(s *Scored, c graph.Candidate) { s.Q3 = c.Hits })
+
+	weigh := func(terms []string, hits int64, df map[string]int) float64 {
+		if o.Corpus <= 0 || len(terms) == 0 {
+			return float64(hits)
+		}
+		sum := 0.0
+		for _, t := range terms {
+			sum += idf(o.Corpus, df[t])
+		}
+		return sum
+	}
+
+	// A specific entity name (multi-part: "opening-account", "imem.save")
+	// matched exactly weighs double its own idf. A single-word name repeats
+	// a keyword's evidence ("account" is tagged on 40 memories but written in
+	// 459), so it counts once, like a term — as does a term that only hit a
+	// token of a longer name. Each term counts at most once per memory.
+	entityWeight := func(id string, hits int64) float64 {
+		exact, part := entTerms[id], partTerms[id]
+		if o.Corpus <= 0 || (len(exact) == 0 && len(part) == 0) {
+			return 2.0 * float64(hits)
+		}
+		w := 0.0
+		counted := make(map[string]bool, len(kwTerms[id]))
+		for _, t := range kwTerms[id] {
+			counted[t] = true
+		}
+		asTerm := func(t string, entDF int) {
+			if counted[t] {
+				return
+			}
+			counted[t] = true
+			df := max(dfKW[t], dfPart[t], entDF)
+			w += idf(o.Corpus, df)
+		}
+		for _, e := range exact {
+			if strings.ContainsAny(e, " _./-") {
+				w += 2.0 * idf(o.Corpus, dfEnt[e])
+				continue
+			}
+			asTerm(e, dfEnt[e])
+		}
+		for _, t := range part {
+			asTerm(t, 0)
+		}
+		return w
+	}
 
 	out := make([]Scored, 0, len(byID))
-	for _, s := range byID {
-		match := 1.0*float64(s.Q1) + 2.0*float64(s.Q2) + 0.75*math.Min(float64(s.Q3), 4)
-		if match == 0 {
+	for id, s := range byID {
+		direct := weigh(kwTerms[id], s.Q1, dfKW) + entityWeight(id, s.Q2)
+		if direct == 0 {
 			continue
 		}
-		ageDays := float64(now-s.LastSeen) / 86400.0
+		// RELATED co-occurrence is weak evidence: at most +1.0.
+		match := direct + 0.25*math.Min(float64(s.Q3), 4)
+		if o.MinMatch > 0 && match < o.MinMatch {
+			continue
+		}
+		// Fresh is last seen OR last used: a memory the assistant relied on
+		// yesterday is as current as one re-extracted yesterday.
+		ageDays := float64(now-max(s.LastSeen, s.LastUsed)) / 86400.0
 		if ageDays < 0 {
 			ageDays = 0
 		}
-		s.Score = match + 2.0*math.Exp(-ageDays/14.0) + 0.3*math.Log(1+float64(s.SeenCount))
+		s.Score = match + 2.0*math.Exp(-ageDays/14.0) + 0.3*math.Log(1+float64(s.SeenCount)) +
+			0.4*math.Log(1+float64(s.UsedCount)) - 1.0*math.Min(float64(s.DisputedCount), 3)
 		if pk != "" && s.ProjectKey == pk {
-			s.Score += sameProjectBoost
+			s.Score += o.SameProjectBoost
 		}
+		s.Matched = uniq(append(append(append([]string(nil), kwTerms[id]...), entTerms[id]...), partTerms[id]...))
+		s.Partial = nil
 		out = append(out, *s)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -193,28 +370,129 @@ func SortRules(rules []graph.Candidate, pk string, k int, exclude map[string]boo
 	return out
 }
 
-// FormatBlock renders the context block injected via additionalContext.
-// Memories from other projects carry a "from <project>" marker.
-func FormatBlock(pk string, mems []Scored, rules []graph.Candidate, maxContentChars int, now int64) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "<infinite-memory project=%q>\n", pk)
-	if len(mems) > 0 {
-		b.WriteString("Long-term memories from previous sessions (background knowledge; verify before relying on it):\n")
-		for _, m := range mems {
-			writeLine(&b, m.Candidate, pk, maxContentChars, now)
+// SessionRules is the standing context injected once per session, in fill
+// order: this project's rules (a parent workspace counts as this project:
+// ~/ws rules apply in ~/ws/repo), its preferences, then every other project's
+// rules and preferences. Within a group: most re-observed, then most recent.
+// The caller's char budget decides how far down the list makes it in.
+func SessionRules(rules, prefs []graph.Candidate, pk string) []graph.Candidate {
+	local := func(c graph.Candidate) bool {
+		return c.ProjectKey != "" && (c.ProjectKey == pk || strings.HasPrefix(pk, c.ProjectKey+"/"))
+	}
+	var groups [4][]graph.Candidate
+	for _, r := range rules {
+		if local(r) {
+			groups[0] = append(groups[0], r)
+		} else {
+			groups[2] = append(groups[2], r)
 		}
 	}
-	if len(rules) > 0 {
-		b.WriteString("Standing rules and conventions (follow these unless the user says otherwise):\n")
-		for _, r := range rules {
-			writeLine(&b, r, pk, maxContentChars, now)
+	for _, p := range prefs {
+		if local(p) {
+			groups[1] = append(groups[1], p)
+		} else {
+			groups[3] = append(groups[3], p)
 		}
 	}
-	b.WriteString("</infinite-memory>")
-	return b.String()
+	var out []graph.Candidate
+	for _, g := range groups {
+		sort.SliceStable(g, func(i, j int) bool {
+			if g[i].SeenCount != g[j].SeenCount {
+				return g[i].SeenCount > g[j].SeenCount
+			}
+			if g[i].LastSeen != g[j].LastSeen {
+				return g[i].LastSeen > g[j].LastSeen
+			}
+			return g[i].ID < g[j].ID
+		})
+		out = append(out, g...)
+	}
+	return out
 }
 
-func writeLine(b *strings.Builder, m graph.Candidate, pk string, maxContentChars int, now int64) {
+// RuleLines renders rules one per line, byte-identical to their lines in a
+// context block clipped the same way (ai-review's prep keeps the lines
+// starting with "- [rule]" and used to scrape them from hook output).
+func RuleLines(pk string, rules []graph.Candidate, maxContentChars int, now int64) []string {
+	out := make([]string, len(rules))
+	for i, r := range rules {
+		out[i] = strings.TrimSuffix(renderLine(r, pk, maxContentChars, now), "\n")
+	}
+	return out
+}
+
+// FormatBlock renders the whole context block, with no size budget.
+func FormatBlock(pk string, mems []Scored, rules []graph.Candidate, maxContentChars int, now int64) string {
+	block, _, _ := BuildBlock(pk, mems, rules, maxContentChars, 0, now)
+	return block
+}
+
+// footerReserve keeps room for the "… N more" line and the closing tag.
+const footerReserve = 120
+
+// BuildBlock renders the context block injected via additionalContext within
+// maxChars (<= 0: no cap): memories in score order first, then rules with
+// whatever room is left, and one line counting what did not fit. It returns
+// the memories and rules actually written. Memories from other projects carry
+// a "from <project>" marker.
+func BuildBlock(pk string, mems []Scored, rules []graph.Candidate, maxContentChars, maxChars int, now int64) (string, []Scored, []graph.Candidate) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<infinite-memory project=%q>\n", pk)
+	fits := func(line string) bool {
+		return maxChars <= 0 || b.Len()+len(line)+footerReserve <= maxChars
+	}
+	var shown []Scored
+	if len(mems) > 0 {
+		header := "Long-term memories from previous sessions (background knowledge; verify before relying on it):\n"
+		if fits(header) {
+			b.WriteString(header)
+			for _, m := range mems {
+				line := renderLine(m.Candidate, pk, maxContentChars, now)
+				if !fits(line) {
+					break
+				}
+				b.WriteString(line)
+				shown = append(shown, m)
+			}
+		}
+	}
+	var shownRules []graph.Candidate
+	if len(rules) > 0 {
+		header := "Standing rules and conventions (follow these unless the user says otherwise):\n"
+		if fits(header) {
+			start := b.Len()
+			b.WriteString(header)
+			for _, r := range rules {
+				line := renderLine(r, pk, maxContentChars, now)
+				if !fits(line) {
+					break
+				}
+				b.WriteString(line)
+				shownRules = append(shownRules, r)
+			}
+			if len(shownRules) == 0 {
+				// A header with nothing under it is noise.
+				s := b.String()[:start]
+				b.Reset()
+				b.WriteString(s)
+			}
+		}
+	}
+	var more []string
+	if n := len(mems) - len(shown); n > 0 {
+		more = append(more, fmt.Sprintf("%d more matched memories", n))
+	}
+	if n := len(rules) - len(shownRules); n > 0 {
+		more = append(more, fmt.Sprintf("%d more standing rules", n))
+	}
+	if len(more) > 0 {
+		fmt.Fprintf(&b, "… %s not shown — imem_search finds more\n", strings.Join(more, " and "))
+	}
+	b.WriteString("</infinite-memory>")
+	return b.String(), shown, shownRules
+}
+
+func renderLine(m graph.Candidate, pk string, maxContentChars int, now int64) string {
 	content := strings.TrimSpace(m.Content)
 	if maxContentChars > 0 && len(content) > maxContentChars {
 		content = content[:maxContentChars] + "…"
@@ -223,7 +501,7 @@ func writeLine(b *strings.Builder, m graph.Candidate, pk string, maxContentChars
 	if m.ProjectKey != "" && m.ProjectKey != pk {
 		meta += ", from " + filepath.Base(m.ProjectKey)
 	}
-	fmt.Fprintf(b, "- [%s] %s — %s (%s)\n", m.Kind, m.Title, content, meta)
+	return fmt.Sprintf("- [%s] %s — %s (%s)\n", m.Kind, m.Title, content, meta)
 }
 
 // summaryTitleChars caps the title column of the CLI summary.
@@ -303,6 +581,8 @@ type SavedLine struct {
 	Kind  string
 	New   bool
 	Seen  int64 // seen_count after the write; shown only when !New
+	// Updated: the memory replaced an older one it was reconciled against.
+	Updated bool
 }
 
 // FormatSaved renders the save-side counterpart of FormatSummary: one line per
@@ -321,7 +601,10 @@ func FormatSaved(lines []SavedLine, maxLines int) string {
 	var out []string
 	for _, l := range shown {
 		state := "new"
-		if !l.New {
+		switch {
+		case l.Updated:
+			state = "replaces older"
+		case !l.New:
 			state = fmt.Sprintf("seen %dx", l.Seen)
 		}
 		line := fmt.Sprintf("  %-12s %-*s  %s",

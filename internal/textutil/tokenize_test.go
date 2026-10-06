@@ -1,6 +1,7 @@
 package textutil
 
 import (
+	"strings"
 	"reflect"
 	"testing"
 )
@@ -56,5 +57,25 @@ func TestTokenize(t *testing.T) {
 				t.Fatalf("Tokenize(%q) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// Prompts are often Indonesian: function words and chat filler carry no
+// topic and used to crowd the topic words out of the token budget.
+func TestIndonesianFillerIsDropped(t *testing.T) {
+	got := Tokenize("setiap request maka ada keyword dari claude, yang ini gimana dong sih udah bisa belum banget bgt", 0)
+	want := []string{"request", "keyword", "claude"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
+// Domain vocabulary must survive: these are what on-call and ai-review
+// queries are made of.
+func TestIndonesianDomainWordsSurvive(t *testing.T) {
+	for _, w := range []string{"rekening", "akun", "nasabah", "dana", "saham", "bank", "pengkinian", "syariah", "kendala", "menghubungkan", "direject", "wajib", "diisi"} {
+		if got := Tokenize(w, 0); len(got) != 1 || got[0] != w {
+			t.Fatalf("domain word %q was dropped: %v", w, got)
+		}
 	}
 }

@@ -1,22 +1,28 @@
 # infinite-memory
 
-Persistent memory for Claude Code, backed by Memgraph. Every user prompt gets relevant
-memories from past sessions injected as context; every assistant response gets memories
-extracted in the background. No embeddings, no API key — extraction runs headless
-`claude -p` on your existing subscription login; retrieval is keyword + graph traversal.
+Persistent memory for Claude Code, backed by Memgraph. Every session starts with its
+project's standing rules; every prompt gets the past memories that match it; every turn
+gets new memories extracted — reconciled against what is already known — and the
+session model can search or save memory itself through MCP tools. No embeddings, no
+API key: extraction runs headless `claude -p` on your subscription login; retrieval is
+idf-weighted keyword + entity matching over the graph, and runs in milliseconds.
 
 ```
-UserPromptSubmit ── imem hook user-prompt ── POST /v1/retrieve ─┐  fail-open, <50ms
-Stop ───────────── imem hook stop ───────────── POST /v1/flush ─┤  blocking, budget-capped
-SessionEnd ─────── imem hook session-end ────── POST /v1/extract ┤  fire-and-forget
-                                                                 ▼
+SessionStart ───── imem hook session-start ─ POST /v1/session-start ┐  standing rules, once
+UserPromptSubmit ── imem hook user-prompt ── POST /v1/retrieve ─────┤  ≤6K chars, ~50ms
+Stop ───────────── imem hook stop ───────── POST /v1/flush ─────────┤  blocking, budget-capped
+SessionEnd ─────── imem hook session-end ── POST /v1/extract ───────┤  fire-and-forget
+imem mcp (stdio) ─ imem_search / imem_remember ── /v1/memories, /v1/remember
+                                                                     ▼
                                      imem daemon (127.0.0.1:7690)
-                                       ├─ retrieve: tokenize → 3 Cypher reads → score → top-K
-                                       ├─ extract queue: 45s debounce → transcript delta →
-                                       │  claude -p (haiku, hooks disabled, structured output)
+                                       ├─ retrieve: tokenize → 3 Cypher reads → idf score
+                                       │  → relevance floor → char budget → per-session dedup
+                                       ├─ extract queue: transcript delta (+ tool summaries)
+                                       │  + similar existing memories + what was shown →
+                                       │  claude -p → add / update / noop + feedback
                                        └─ save log: what each run wrote, drained once by
                                           whichever hook reports it first
-                                                                 ▼
+                                                                     ▼
                                      Memgraph (bolt://127.0.0.1:7687, docker compose)
 ```
 
@@ -24,15 +30,18 @@ SessionEnd ─────── imem hook session-end ────── POST /
 
 ```sh
 make up        # memgraph + memgraph-lab (http://localhost:3000)
-make install   # builds ~/.local/bin/imem
-make init      # schema: 8 indexes, 4 constraints
+make install   # builds ~/.local/bin/imem (atomically: build to .tmp, then rename)
+make init      # schema: indexes + constraints
 make run       # daemon in foreground (or install via launchd — section below)
 make hooks-json  # prints the snippet to merge into ~/.claude/settings.json
+claude mcp add --scope user imem -- ~/.local/bin/imem mcp   # imem_search / imem_remember
 ```
 
 Hooks are registered as additional array entries in `~/.claude/settings.json`
-(`UserPromptSubmit` → retrieve, `Stop`/`SessionEnd` → extract). New Claude Code sessions
-pick them up automatically.
+(`SessionStart` → standing rules, `UserPromptSubmit` → retrieve, `Stop`/`SessionEnd` →
+extract). New Claude Code sessions pick them up automatically. Allowlisting
+`mcp__imem__imem_search` is safe (read-only); leave `imem_remember` behind its
+permission prompt — a model that read a malicious file could otherwise plant a rule.
 
 ## launchd (macOS): run the daemon at login
 
@@ -129,54 +138,92 @@ every escaped statement.
 ## How it works
 
 - **Memories** are `fact | decision | preference | rule | reference` nodes tagged with
-  the project they came from (git root of the session cwd), linked to `Entity` nodes
-  (`MENTIONS`) with co-occurrence `RELATED` edges. Extraction is told to always tag the
-  business/domain topic ("personal amend request", "jago whitelist", "BCA API") as an
-  entity — topics are the retrieval index.
-- **Retrieval is GLOBAL, topic-based — not cwd-partitioned** (no embeddings): shared
-  tokenizer on save + query; candidates from direct keyword hits, entity-name hits
-  (2x weight), and 1-hop `RELATED` expansion across ALL projects; scored with recency
-  decay (`2·e^(-age/14d)`), a `seen_count` bonus, and a same-project boost
-  (`same_project_boost`, default 1.0) so local context wins ties without hiding other
-  repos. Foreign memories carry a `from <project>` marker. Top matches are capped by
-  `retrieve_k` (default 6, `-1` for no cap).
-- **Standing rules**: `rule` memories (coding constitution — LOC limits, max args,
-  per-repo patterns, code style, MR templates) are ALWAYS injected, current-project
-  first, capped by `rules_k` (default 50) — independent of keyword match. The whole
-  rule pool is fetched and prioritized in Go before the cap, so the cap keeps the
-  *best* rules, not an arbitrary slice.
-- **Extraction**: the worker reads the transcript delta since the stored cursor,
-  prompts `claude -p --model claude-haiku-4-5-20251001` with `--json-schema` structured
-  output, and MERGEs results into the graph (content-hash dedup; same-title memories
-  supersede older versions). By default the Stop hook **blocks** on `/v1/flush` so it
-  can print what the turn actually saved; a delta under 200 chars skips the spawn and
-  returns in milliseconds, so only substantive turns pay. Past `stop_flush_budget_ms`
-  (default 90s) the daemon answers `running`, the extraction finishes in the background,
-  and its report prints at the next prompt. `hook_flush_on_stop: false` restores the old
-  fire-and-forget behaviour, where `SessionEnd` and the 45s debounce do the saving.
+  the project they came from, linked to `Entity` nodes (`MENTIONS`) with co-occurrence
+  `RELATED` edges. Extraction is told to always tag the business/domain topic
+  ("personal amend request", "jago whitelist", "BCA API") as an entity — topics are the
+  retrieval index. Each memory also carries 3-10 **aliases**: the words a future prompt
+  would use for it that its text does not contain — Indonesian terms, synonyms, joined
+  and split identifiers (`bca rdn` ↔ `bcardn`) — indexed as keywords. This is query
+  expansion done once per memory at save time instead of once per prompt.
+- **Project = repository.** A session's project is the git root of its cwd, and a linked
+  worktree (`.superset/worktrees/<id>/<branch>`) resolves to its main repository, so
+  every checkout of a repo shares one project. Older worktree-keyed memories carry a
+  `repo_key` (see Maintenance).
+- **Retrieval is GLOBAL, topic-based**: shared tokenizer on save + query (English and
+  Indonesian stopwords, 32 prompt tokens); candidates from keyword hits, entity hits and
+  1-hop `RELATED` neighbours across ALL projects. Scoring:
+  - every matched term weighs its BM25 **idf** — `go` (in 550 memories) counts ~1.3, a
+    term in one memory ~7 — so common words stop drowning rare ones;
+  - an exact multi-part entity name (`opening-account`, `imem.save`) counts double its
+    own idf; a single-word entity or a term that only hit a token of a longer name counts
+    once, like a keyword;
+  - `RELATED` neighbours only re-rank direct matches (≤ +1.0) and only over edges seen at
+    least `related_min_weight` times — on their own they once pulled 1,020 memories into
+    one prompt;
+  - the **relevance floor** `min_match` drops weak matches before any boost is added;
+  - boosts: recency `2·e^(-age/14d)` (age from last seen *or last used*), `seen_count`,
+    `used_count`, a penalty per dispute, and `same_project_boost`.
+- **Injection budget.** Claude Code inlines `additionalContext` only up to 10,000 chars
+  and shows a 2KB preview of anything larger, so the block is capped at
+  `retrieve_max_chars` (6,000), best-scored first, ending with "… N more matched —
+  imem_search finds more". Memories already injected earlier in the session are skipped
+  (they are still in context); `/clear` and compaction reset that.
+- **Standing rules arrive once, at SessionStart** (also after `/clear`, resume and
+  compaction): this project's rules — a parent workspace counts as this project — then
+  its preferences, then other projects' rules and preferences, within `rules_max_chars`.
+  Per prompt, rules still surface like any memory when their topic matches.
+- **Extraction**: the worker reads the transcript delta since the stored cursor — the
+  text of each turn plus one-line tool summaries (`Edit <path>`, `Bash: <description>`;
+  never a command, which may carry secrets) — and prompts `claude -p` (`extract_model`)
+  with `--json-schema`. Two more things go into the prompt for your own sessions:
+  - **reconcile** — the 12 existing memories most like the excerpt; each new memory says
+    `add`, `update` (it replaces that memory, which is superseded) or `noop` (that
+    memory already says it; it is re-observed, `seen_count` grows);
+  - **feedback** — the memories the session was shown since the last extraction; the
+    extractor grades the ones the conversation gives evidence about as `used`, `wrong`
+    or `outdated`. `used` raises `used_count` and freshness; disputes lower the score.
+    Retiring a memory still takes an `update` naming its replacement.
+
+  Targets and grades are whitelisted to the ids the model was shown. By default the Stop
+  hook **blocks** on `/v1/flush` so it can print what the turn saved; a delta under 200
+  chars skips the spawn. Past `stop_flush_budget_ms` (default 90s) the daemon answers
+  `running` and its report prints at the next prompt.
 - **Agent transcripts**: a transcript outside `~/.claude/projects` is only accepted from
   a configured `agent_roots` directory (symlinks resolved), is extracted in isolated mode
-  (no MCP servers, settings or tools), and never saves a `rule` or `preference` — those
-  become `fact`. A bot writes after reading untrusted text; rules reach every session.
-- **Recursion guards**: spawned claude runs with `--settings '{"disableAllHooks":true}'`
-  and `INFINITE_MEMORY_INTERNAL=1`; every hook subcommand exits instantly when that env
-  var is set. `--bare` is deliberately NOT used — it disables subscription OAuth.
+  (no MCP servers, settings or tools), never saves a `rule` or `preference` (those become
+  `fact`), and stays add-only: no reconcile, no feedback — a bot's text may add facts,
+  never retire, reinforce or grade yours.
+- **Ignored directories** (`ignore_cwds`, default `~/.claude/double-shot-latte`): sessions
+  there get no retrieve and no extraction. double-shot-latte's continuation judge runs
+  `claude -p` there with a copy of the conversation; it was 38% of all retrieves.
+  Background-task notifications are not retrieved for either.
+- **Recursion guards**: spawned claude runs with `--settings '{"disableAllHooks":true}'`,
+  `--strict-mcp-config` and `INFINITE_MEMORY_INTERNAL=1`; every hook subcommand and
+  `imem mcp` exit instantly when that env var is set. `--bare` is deliberately NOT used —
+  it disables subscription OAuth.
 - **Visible in the CLI, both directions**: the hooks emit a `systemMessage`, so every
   prompt prints what memory *read* and every turn prints what it *wrote*. The no-match,
   daemon-down and extraction-failed cases print too, because silent memory and dead
   memory otherwise look identical — this project shipped two weeks of completely failed
   extraction before the save side was visible.
 
-  Retrieve, at `UserPromptSubmit` — one line per injected memory (kind, clipped title,
-  age, score, `↖source-project` when foreign), rules collapsed to a count:
+  Standing rules, at `SessionStart`:
 
   ```
-  imem: 6 memories + 50 rules (12ms)
+  imem: 18 standing rules, 3 preferences (17ms) · 29 more over budget
+  ```
+
+  Retrieve, at `UserPromptSubmit` — one line per injected memory (kind, clipped title,
+  age, score, `↖source-project` when foreign), then what the budget left out:
+
+  ```
+  imem: 6 memories + 0 rules (12ms)
     [fact]       Recursion guard via env sentinel       7d ago    8.4
     [decision]   Field masks modeled as a domain enum   3h ago    7.1  ↖opening-account
-    … 4 more · 50 standing rules
+    … 4 more
+    3 more matched, over the 6000-char budget
 
-  imem: no matches — 0 memories, 50 rules (9ms)
+  imem: no matches — 0 memories, 0 rules (9ms)
   imem: daemon unreachable — memory off
   ```
 
@@ -186,7 +233,7 @@ every escaped statement.
   ```
   imem: saved 5 memories (32.7s)
     [fact]       account repo migrated to urfave/cli v3            new
-    [reference]  Single-binary CLI verification checklist for ac…  new
+    [decision]   Expansion moved to index time                     replaces older
     [rule]       Formatter mirrors FormatSummary columns           seen 4x
 
   imem: saved nothing — no new facts this turn
@@ -206,80 +253,141 @@ every escaped statement.
   back to the fire-and-forget `/v1/extract` call, so the turn is still saved — just
   later, and without a line.
 
+## Pull: the MCP tools
+
+`imem mcp` is a stdio MCP server (stdlib JSON-RPC; registered at user scope). The session
+model writes its own queries with the whole conversation as context — the job the old
+per-prompt LLM expander did in tens of seconds, now free and only when needed.
+
+| tool | does |
+|---|---|
+| `imem_search(query, limit≤20)` | `/v1/memories` (same ranking, no floor): one line per memory with kind, title, content, age and source repo |
+| `imem_remember(title, content, kind, entities?)` | `/v1/remember` → `SaveBatch` under the session's project, in a per-day `mcp-` session (dedup and same-title supersede apply) |
+
+The hook block's "… N more matched — imem_search finds more" line points the model at it.
+
 ## Ops
 
 ```sh
 imem status                  # daemon + memgraph health, per-project counts,
                              # and recent extraction runs (including failures)
 imem search "query"          # search memories (global, boosted for current project)
+imem rules [--cwd p] [--limit N]   # every live rule, this project first, one per line
 imem entities [--project] [--limit N]   # entities by mention count (global by default)
 imem entity <name...>        # one entity: relations (verb/weight) + memories mentioning it
+imem eval [--mode hook|search] [--json]   # score retrieval on labelled cases (Evaluation)
 imem backups                 # list host-side graph dumps (see Backups)
 imem backup                  # dump the graph now
 tail -f ~/.local/state/infinite-memory/imemd.log
 make cypher                  # mgconsole inside the container
-make test                    # unit tests
-make itest                   # integration tests (needs make up)
+make test                    # unit tests (incl. the agent contract tests)
+make itest                   # integration tests on a fresh throwaway Memgraph (7688)
+make itest-down              # stop that test instance
 ```
 
-Config: `~/.config/infinite-memory/config.json` (see `config.example.json`); all fields
-optional.
+`make itest` never touches the live graph: it recreates the `memgraph-test` compose
+service (127.0.0.1:7688, no volume) and the tests refuse `memgraph_uri` unless
+`IMEM_TEST_ALLOW_LIVE=1`.
 
-The three capped knobs share one convention:
+## Maintenance
 
-| value | `retrieve_k` | `rules_k` | `hook_summary_lines` | `hook_saved_lines` |
-|---|---|---|---|---|
-| `-1` (any negative) | no cap — every match | no cap — every rule | no cap — one line per memory | no cap — one line per memory |
-| `0` / absent | compiled default (6) | **rules section off** | compiled default (6) | compiled default (6) |
-| `n > 0` | top n | best n rules | first n lines, rest as "… N more" | first n lines, rest as "… N more" |
+All three are dry runs until told otherwise, and none deletes anything.
 
-`rules_k` is the odd one out: it is the only section you can switch off, so `0` means
-disabled there rather than "use the default".
-
-## LLM query expansion (off by default)
-
-The tokenizer drops generic dev vocabulary — `issue`, `problem`, `error`, `fix`, `use`,
-`file`, `code` are all stopwords — so a prompt like `solve this issue` tokenizes to
-`["solve"]` and matches almost nothing. Expansion asks headless `claude` for extra search
-terms in the index's own vocabulary, then appends them to the token list. Nothing else
-changes: the Cypher, the scoring and the graph schema are untouched.
-
-```json
-{ "expand_enabled": true, "expand_model": "claude-haiku-4-5-20251001", "expand_budget_ms": 30000 }
+```sh
+imem backfill-aliases [--limit N] [--batch 10] [--workers 6] [--yes]
+imem migrate-repo-keys [--map old=new]... [--yes]
+imem consolidate [--plan | --apply] [--limit N] [--min-jaccard 0.4]
+imem consolidate --archive [--apply]
 ```
+
+- **backfill-aliases** gives memories saved before aliases existed (`aliases IS NULL`)
+  their aliases: one isolated `expand_model` spawn per batch, batches partitioned across
+  workers, resumable (a memory the model skipped gets an empty list and is done).
+- **migrate-repo-keys** sets `repo_key` on memories saved under a worktree path: from the
+  worktree itself when it still exists, else from a live sibling under the same
+  `.superset/worktrees/<id>/`, else from a repository named like `<id>`, else `--map`.
+  Additive: `project_key` and hashes stay; undo is `REMOVE m.repo_key`.
+- **consolidate** clusters near-duplicates (a shared entity and keyword Jaccard ≥ 0.4),
+  asks `extract_model` which really say the same thing (`--plan` prints its merges),
+  and with `--apply` saves one canonical memory per merge and supersedes the members.
+  A merge never escalates a kind (facts never become a rule). `--archive` lists memories
+  injected 20+ times, never used, unseen for 60+ days; `--apply` sets `archived` (out of
+  retrieval; undo `REMOVE m.archived`). `consolidate_enabled` runs the merge daily from
+  the daemon — off by default; review a `--plan` first.
+
+## Evaluation
+
+`imem eval` runs the labelled cases in `~/.config/infinite-memory/eval.jsonl` (one JSON
+per line: `name`, `mode`, `prompt`, `cwd`, `expect` = title substrings) and reports hit
+rate, MRR, recall, block size and latency per mode:
+
+- `hook` scores what the model can actually SEE — the whole block up to 10,000 chars, the
+  2KB preview beyond that — through the side-effect-free `POST /v1/retrieve/preview`;
+- `search` scores `imem search`'s top 10, which is what the ai-review and on-call agents
+  read.
+
+`--json` prints everything for diffing a baseline. On 24 cases (12 interactive prompts, 12
+real agent queries) the move from live LLM expansion to idf scoring went: hook hit 58% →
+92% (MRR 0.38 → 0.66, block 719KB → 5KB, p50 41s → 26ms); search hit 75% → 92% (MRR 0.37 →
+0.57, p50 40s → 24ms).
+
+## Agent contract (ai-review, on-call)
+
+The bots in `~/scratch` use imem from deterministic code and parse some of its output.
+`cmd/imem/contract_test.go` and `internal/daemon/server_test.go` pin each of these; change
+the agents before changing any of them:
+
+| caller | uses | contract |
+|---|---|---|
+| on-call `preflight.imem_status`, `doctor` | `imem status` | exit 0, first line has `daemon: up` and `memgraph: true` (gates every full run) |
+| `agentkit.imem.entities` / `entity_matches` | `imem entities --limit 500` | lines match `\s*(\d+)x\s+(.+?)\s{2,}\[` |
+| on-call prep, ai-review `run_imem` | `imem entity "<name>"`, `imem search "<q>" --cwd ~/accountworkspace` | flags and line format unchanged, search capped at 10, no relevance floor |
+| ai-review `prep.newest_rules` | `imem rules --cwd ~/accountworkspace` | bare `- [rule] …` lines, non-zero exit when the daemon is down |
+| `agentkit.imem.save` | `POST /v1/extract` (`session_end`, transcript under an `agent_roots` dir) | 202; extracted isolated, add-only, rules demoted |
+
+The agents run `claude -p --restricted --strict-mcp-config` with explicit MCP lists, so
+imem's hooks never fire in them and the `imem` MCP server is never visible to them.
+
+## Coexistence with other memory systems
+
+| system | role here |
+|---|---|
+| imem | automatic, cross-repo long-term memory; pushed per prompt, pulled via MCP |
+| Claude Code auto-memory (`MEMORY.md`) | per-project notes the session model writes itself; overlaps with `imem_remember` |
+| episodic-memory plugin | full-text search over raw past transcripts; complementary |
+| claude-mem plugin | installed but disabled since 2026-04; its `<claude-mem-context>` blocks in `~/.claude/CLAUDE.md` and `~/play/CLAUDE.md` are stale yet still loaded every session |
+
+## Config
+
+`~/.config/infinite-memory/config.json` (see `config.example.json`); all fields
+optional. Retrieval knobs:
 
 | key | default | meaning |
 |---|---|---|
-| `expand_enabled` | `false` | the kill switch. Note the polarity: every other bool here defaults `true`, this one defaults `false`, because expansion costs real seconds on every prompt. |
-| `expand_model` | `claude-haiku-4-5-20251001` | deliberately separate from `extract_model` — extraction runs a big model off the critical path, expansion runs a small one while you wait. |
-| `expand_budget_ms` | `30000` | spent *before* the `retrieve_timeout_ms` graph budget, never inside it. On expiry you get exactly the unexpanded result. |
+| `retrieve_k` | 6 | max memories per prompt before the char budget |
+| `retrieve_max_chars` | 6000 | per-prompt block budget (Claude Code inlines ≤10,000) |
+| `min_match` | 2.0 | relevance floor on the hook path (0 disables) |
+| `related_min_weight` | 2 | minimum `RELATED` edge weight the 1-hop query follows |
+| `rules_on_session_start` | true | standing rules once per session instead of per prompt |
+| `rules_max_chars` | 8000 | SessionStart block budget |
+| `rules_k` | 50 | standing rules considered before the budget (0 = off) |
+| `ignore_cwds` | `["~/.claude/double-shot-latte"]` | sessions memory never touches |
+| `consolidate_enabled` | false | daily consolidation in the daemon |
+| `consolidate_interval_hours` / `consolidate_min_jaccard` | 24 / 0.4 | its schedule and cluster threshold |
 
-Nothing else is tunable. How many terms to return is the model's decision; the structural
-bounds live in the JSON schema the CLI enforces.
+The capped knobs share one convention:
 
-**The cost is real and it is not small.** Measured on this machine with `claude-haiku-4-5`,
-the isolated spawn (`--safe-mode --strict-mcp-config --setting-sources "" --tools ""
---effort low`, which removes a ~30K-token preamble):
+| value | `retrieve_k`, `retrieve_max_chars`, `rules_max_chars` | `rules_k` | `hook_summary_lines`, `hook_saved_lines` |
+|---|---|---|---|
+| `-1` (any negative) | no cap | no cap — every rule | no cap — one line per memory |
+| `0` / absent | compiled default | **rules off** | compiled default (6) |
+| `n > 0` | n | best n rules | first n lines, rest as "… N more" |
 
-| | |
-|---|---|
-| fastest observed | 6.5s |
-| typical | 14-19s |
-| slowest observed | 43s |
-| cost per prompt | ~$0.01 |
+## Legacy: live LLM query expansion (off)
 
-Almost all of it is thinking tokens (1,000-5,000 per call), and the spread is wide and
-unpredictable — the same prompt can take 7s or time out. Claude Code renders nothing while
-a `UserPromptSubmit` hook runs, so that shows up as a hang. Try it on the CLI first:
-
-```
-imem expand "solve this issue"       # what would be added, without searching
-```
-
-`imem expand` ignores `expand_enabled` on purpose, so you can judge expansion before you
-turn it on.
-
-**Set `retrieve_k` to a real number before enabling.** With `retrieve_k: -1` a broad
-expansion injects every match into the context block; 30 generic tokens match 442 of 607
-memories in this graph, and the hook's injection has already been silently truncated at
-102.9KB once.
+`expand_enabled: true` still asks headless `claude` for extra search terms on every prompt
+before the graph is touched. It is off by default and should stay off: measured over the
+last 300 prompts it cost **32s median, 59s p90, up to 5 minutes** (a timeout) per prompt
+for a median of two extra terms, and Claude Code renders nothing while a
+`UserPromptSubmit` hook runs. Its job is now done by index-time aliases and by the session
+model querying `imem_search` itself. `imem expand "prompt"` still shows what it would add.

@@ -9,6 +9,14 @@ services:
       - mg_log:/var/log/memgraph
     command: ["--log-level=WARNING", "--also-log-to-stderr"]
     restart: unless-stopped
+  # Throwaway instance for make itest: no volume, only started under the
+  # "test" profile, so integration fixtures never touch the live graph.
+  memgraph-test:
+    image: memgraph/memgraph-mage:latest
+    profiles: ["test"]
+    ports:
+      - "127.0.0.1:7688:7687"
+    command: ["--log-level=WARNING", "--also-log-to-stderr"]
   lab:
     image: memgraph/lab:latest
     ports:

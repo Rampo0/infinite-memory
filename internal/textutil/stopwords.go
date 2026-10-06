@@ -30,6 +30,27 @@ func init() {
 		"work", "works", "working", "use", "using", "used", "fix", "add",
 		"change", "update", "run", "running", "code", "file", "files", "error",
 		"issue", "problem", "question", "hey", "hi", "hello",
+		// Indonesian function words and chat filler (prompts are often
+		// Indonesian, memories mostly English). Function words only: domain
+		// vocabulary — rekening, akun, nasabah, dana, saham — must survive.
+		"yang", "yg", "ini", "itu", "dan", "di", "ke", "dari", "untuk", "utk", "buat",
+		"ada", "akan", "adalah", "ialah", "saya", "aku", "gw", "gue", "gua", "kamu",
+		"lu", "lo", "kita", "kami", "mereka", "dia", "ia", "nya", "apa", "apakah",
+		"adakah", "gimana", "bagaimana", "kenapa", "mengapa", "kapan", "dimana",
+		"mana", "siapa", "berapa", "tolong", "mohon", "dong", "deh", "sih", "kok",
+		"kan", "lah", "ya", "yah", "nih", "tuh", "aja", "saja", "udah", "sudah",
+		"belum", "blm", "bisa", "mau", "ingin", "pengen", "kalau", "kalo", "klo",
+		"jika", "jadi", "jd", "terus", "trus", "lalu", "lagi", "lg", "juga", "jg",
+		"dengan", "dgn", "atau", "tapi", "tetapi", "namun", "karena", "krn", "karna",
+		"soalnya", "gak", "ga", "nggak", "ngga", "enggak", "tidak", "tdk", "bukan",
+		"setiap", "tiap", "maka", "sebelum", "sesudah", "setelah", "sekarang",
+		"skrng", "skrg", "tadi", "nanti", "masih", "sedang", "pada", "oleh",
+		"sebagai", "seperti", "kayak", "dalam", "kedalam", "atas", "bawah", "antara",
+		"hal", "cara", "coba", "cek", "tanya", "pastikan", "sebut", "benar", "bener",
+		"betul", "dulu", "dahulu", "terlebih", "sebelumnya", "berikut", "tersebut",
+		"begitu", "gitu", "gini", "begini", "sini", "situ", "sana", "hanya", "cuma",
+		"semua", "sama", "punya", "harus", "perlu", "boleh", "bikin", "hasil",
+		"sendiri", "selesai", "saran", "nah", "oke", "sip", "banget", "bgt", "sangat", "amat",
 	}
 	for _, w := range words {
 		stopwords[w] = struct{}{}

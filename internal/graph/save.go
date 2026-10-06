@@ -25,6 +25,15 @@ type MemoryIn struct {
 	Entities []EntityIn
 	// Relations are [a, verb, b] triples between entities of this memory.
 	Relations [][3]string
+	// Aliases are other words a future prompt would use for this memory
+	// (synonyms, Indonesian, joined identifiers); they are indexed as
+	// keywords, so expansion happens once at save time, not per prompt.
+	Aliases []string
+	// Op is the reconcile decision against existing memories: "add" (or ""),
+	// "update" (this replaces TargetID, which gets superseded) or "noop"
+	// (TargetID already says this; it is only re-observed).
+	Op       string
+	TargetID string
 }
 
 // SaveOutcome is one memory's result in a batch. New is false when the content
@@ -36,6 +45,8 @@ type SaveOutcome struct {
 	Kind  string `json:"kind"`
 	New   bool   `json:"new"`
 	Seen  int64  `json:"seen"`
+	// Updated: this memory replaced (superseded) the one it was reconciled to.
+	Updated bool `json:"updated,omitempty"`
 }
 
 // HashContent is the dedup key: same content in the same project collapses
@@ -57,13 +68,18 @@ WITH s
 MATCH (p:Project {key: $pk})
 MERGE (s)-[:IN_PROJECT]->(p)`
 
+// A re-observation unions in new keywords and aliases: the same fact seen
+// again may arrive with words the first extraction did not think of.
 const qUpsertMemory = `
 MERGE (m:Memory {hash: $hash})
   ON CREATE SET m.id = $id, m.title = $title, m.title_lc = $title_lc,
                 m.content = $content, m.kind = $kind, m.keywords = $keywords,
+                m.aliases = $aliases,
                 m.project_key = $pk, m.created_at = $now, m.seen_count = 1,
                 m.superseded = false, m.source_session = $sid
-  ON MATCH  SET m.seen_count = m.seen_count + 1
+  ON MATCH  SET m.seen_count = m.seen_count + 1,
+                m.keywords = coalesce(m.keywords, []) + [k IN $keywords WHERE NOT k IN coalesce(m.keywords, [])],
+                m.aliases = coalesce(m.aliases, []) + [a IN $aliases WHERE NOT a IN coalesce(m.aliases, [])]
 SET m.last_seen_at = $now
 WITH m
 MATCH (p:Project {key: $pk}) MERGE (m)-[:IN_PROJECT]->(p)
@@ -77,6 +93,25 @@ WHERE old.hash <> $hash AND NOT coalesce(old.superseded, false)
 MATCH (new:Memory {hash: $hash})
 MERGE (new)-[:SUPERSEDES]->(old)
 SET old.superseded = true`
+
+// qSupersedeID retires the memory a reconcile "update" replaces, by id.
+const qSupersedeID = `
+MATCH (old:Memory {id: $target})
+WHERE old.hash <> $hash AND NOT coalesce(old.superseded, false)
+MATCH (new:Memory {hash: $hash})
+MERGE (new)-[:SUPERSEDES]->(old)
+SET old.superseded = true
+RETURN count(old) AS n`
+
+// qReobserve is a reconcile "noop": the target already says this, so it is
+// only re-observed — with any new aliases the extractor came up with.
+const qReobserve = `
+MATCH (m:Memory {id: $target})
+WHERE NOT coalesce(m.superseded, false)
+SET m.seen_count = m.seen_count + 1, m.last_seen_at = $now,
+    m.aliases = coalesce(m.aliases, []) + [a IN $aliases WHERE NOT a IN coalesce(m.aliases, [])],
+    m.keywords = coalesce(m.keywords, []) + [k IN $toks WHERE NOT k IN coalesce(m.keywords, [])]
+RETURN m.id AS id, m.title AS title, m.kind AS kind, m.seen_count AS sc`
 
 const qUpsertEntity = `
 MERGE (e:Entity {key: $ekey})
@@ -133,13 +168,32 @@ func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems [
 		}
 
 		for _, m := range mems {
+			if m.Op == "noop" {
+				res, err := tx.Run(ctx, qReobserve, map[string]any{
+					"target": m.TargetID, "now": now, "aliases": toAny(m.Aliases),
+					"toks": toAny(textutil.Tokenize(strings.Join(m.Aliases, " "), 24)),
+				})
+				if err != nil {
+					return nil, err
+				}
+				if res.Next(ctx) {
+					rec := res.Record()
+					saved = append(saved, SaveOutcome{ID: recStr(rec, "id"), Title: recStr(rec, "title"),
+						Kind: recStr(rec, "kind"), Seen: recInt(rec, "sc")})
+				}
+				if err := res.Err(); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			hash := HashContent(pk, m.Content)
 			titleLC := strings.ToLower(strings.TrimSpace(m.Title))
 			res, err := tx.Run(ctx, qUpsertMemory, map[string]any{
 				"hash": hash, "id": hash[:16],
 				"title": m.Title, "title_lc": titleLC,
 				"content": m.Content, "kind": m.Kind,
-				"keywords": toAny(textutil.Tokenize(m.Title+" "+m.Content, 32)),
+				"keywords": toAny(MemoryKeywords(m)),
+				"aliases":  toAny(m.Aliases),
 				"pk":       pk, "now": now, "sid": sid,
 			})
 			if err != nil {
@@ -157,6 +211,16 @@ func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems [
 				})
 				if err != nil {
 					return nil, err
+				}
+			}
+			updated := false
+			if m.Op == "update" && m.TargetID != "" {
+				res, err := tx.Run(ctx, qSupersedeID, map[string]any{"target": m.TargetID, "hash": hash})
+				if err != nil {
+					return nil, err
+				}
+				if r, err := res.Single(ctx); err == nil {
+					updated = recInt(r, "n") > 0
 				}
 			}
 
@@ -225,7 +289,7 @@ func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems [
 				}
 			}
 			saved = append(saved, SaveOutcome{
-				ID: hash[:16], Title: m.Title, Kind: m.Kind, New: created, Seen: seen,
+				ID: hash[:16], Title: m.Title, Kind: m.Kind, New: created, Seen: seen, Updated: updated,
 			})
 		}
 		return nil, nil
@@ -234,6 +298,24 @@ func (s *Store) SaveBatch(ctx context.Context, pk, sid string, now int64, mems [
 		return nil, err
 	}
 	return saved, nil
+}
+
+// MemoryKeywords is a memory's index terms: its title and content (capped)
+// plus its aliases, tokenized separately so a long content can never crowd
+// the aliases out of the cap.
+func MemoryKeywords(m MemoryIn) []string {
+	kw := textutil.Tokenize(m.Title+" "+m.Content, 32)
+	seen := make(map[string]bool, len(kw))
+	for _, k := range kw {
+		seen[k] = true
+	}
+	for _, k := range textutil.Tokenize(strings.Join(m.Aliases, " "), 24) {
+		if !seen[k] {
+			seen[k] = true
+			kw = append(kw, k)
+		}
+	}
+	return kw
 }
 
 func projectName(pk string) string {

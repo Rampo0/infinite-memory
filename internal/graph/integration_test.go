@@ -5,27 +5,53 @@ package graph
 import (
 	"context"
 	"fmt"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+
 	"github.com/Rampo0/infinite-memory/internal/backup"
+	"github.com/Rampo0/infinite-memory/internal/config"
 )
 
-// Requires a running Memgraph (make up). Run with: make itest
-// Retrieval is global, so assertions filter candidates to this test's pk —
-// the live database may hold real memories that also match.
+// Run with: make itest — it starts a throwaway Memgraph on 7688 first.
+// Every test seeds /itest/<nanos> fixtures and never deletes them, which is
+// why the live graph (config memgraph_uri, 7687 by default) is refused: those
+// fixtures used to compete with real memories in every search. Assertions
+// still filter candidates to the test's own pk.
+
+// testBoltURI is IMEM_TEST_BOLT (default the make itest instance), never the
+// live graph unless IMEM_TEST_ALLOW_LIVE=1.
+func testBoltURI(t *testing.T) string {
+	t.Helper()
+	uri := os.Getenv("IMEM_TEST_BOLT")
+	if uri == "" {
+		uri = "bolt://127.0.0.1:7688"
+	}
+	if uri == config.Load().MemgraphURI && os.Getenv("IMEM_TEST_ALLOW_LIVE") != "1" {
+		t.Fatalf("refusing to seed test fixtures into the live graph at %s (IMEM_TEST_ALLOW_LIVE=1 overrides)", uri)
+	}
+	return uri
+}
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := New("bolt://127.0.0.1:7687", "", "")
+	uri := testBoltURI(t)
+	s, err := New(uri, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The test instance may still be booting right after make itest starts it.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := s.Ping(ctx); err != nil {
-		t.Skipf("memgraph not reachable: %v", err)
+	for err = s.Ping(ctx); err != nil && ctx.Err() == nil; err = s.Ping(ctx) {
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
+		t.Skipf("test memgraph not reachable at %s (make itest starts it): %v", uri, err)
 	}
 	if err := s.EnsureSchema(ctx); err != nil {
 		t.Fatal(err)
@@ -77,7 +103,7 @@ func TestSaveAndCandidates(t *testing.T) {
 		}
 	}
 
-	q1, q2, _, err := s.Candidates(ctx, []string{"daemon", "port"})
+	q1, q2, _, err := s.Candidates(ctx, []string{"daemon", "port"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +115,7 @@ func TestSaveAndCandidates(t *testing.T) {
 	}
 
 	// Q2 exact entity name, scoped to this pk.
-	_, q2b, _, err := s.Candidates(ctx, []string{"memgraph"})
+	_, q2b, _, err := s.Candidates(ctx, []string{"memgraph"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +125,7 @@ func TestSaveAndCandidates(t *testing.T) {
 
 	// Q3: 1-hop — "retrieval" relates to "memgraph" via co-occurrence, and
 	// memgraph mentions the port memory, so expansion should reach it.
-	_, _, q3b, err := s.Candidates(ctx, []string{"retrieval"})
+	_, _, q3b, err := s.Candidates(ctx, []string{"retrieval"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +158,7 @@ func TestGlobalRetrievalAcrossProjects(t *testing.T) {
 	}
 	_ = pkB // the query below simulates asking from repoB: no pk filter anywhere
 
-	_, q2, _, err := s.Candidates(ctx, []string{fmt.Sprintf("zzz"), "jago", "whitelist"})
+	_, q2, _, err := s.Candidates(ctx, []string{fmt.Sprintf("zzz"), "jago", "whitelist"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +207,7 @@ func TestDedupBumpsSeenCount(t *testing.T) {
 	if _, err := s.SaveBatch(ctx, pk, "sess-2", now+10, batch); err != nil {
 		t.Fatal(err)
 	}
-	q1, _, _, err := s.Candidates(ctx, []string{"listens"})
+	q1, _, _, err := s.Candidates(ctx, []string{"listens"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +232,7 @@ func TestSupersede(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	q1, _, _, err := s.Candidates(ctx, []string{"daemon", "listens"})
+	q1, _, _, err := s.Candidates(ctx, []string{"daemon", "listens"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,6 +404,12 @@ func TestDumpIsReplayable(t *testing.T) {
 
 	var checked, withEscapes int
 	for _, q := range stmts {
+		// EXPLAIN cannot parse DDL, and the NUL bug lives in data statements.
+		// Against the big live graph the 50-statement slice never reached the
+		// schema tail; the small isolated test graph does.
+		if isSchemaStatement(q) {
+			continue
+		}
 		esc := backup.EscapeControl(q)
 		// Every statement carrying a control byte is a candidate for the bug;
 		// a slice of the rest keeps the test honest without 2000 round trips.
@@ -395,5 +427,463 @@ func TestDumpIsReplayable(t *testing.T) {
 	t.Logf("validated %d/%d statements (%d needed escaping)", checked, len(stmts), withEscapes)
 	if withEscapes == 0 {
 		t.Log("note: no control bytes in this graph, the NUL path went unexercised")
+	}
+}
+
+// isSchemaStatement reports DUMP DATABASE's index/constraint statements.
+func isSchemaStatement(q string) bool {
+	u := strings.ToUpper(strings.TrimSpace(q))
+	for _, p := range []string{"CREATE INDEX", "CREATE EDGE INDEX", "CREATE TEXT INDEX", "CREATE POINT INDEX",
+		"CREATE VECTOR INDEX", "CREATE CONSTRAINT", "DROP INDEX", "DROP CONSTRAINT", "DROP EDGE INDEX"} {
+		if strings.HasPrefix(u, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// The retriever's idf needs to know WHICH terms and entities each memory
+// matched, not only how many.
+func TestCandidatesReturnMatchedTerms(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-matched", time.Now().UnixNano())
+	if _, err := s.SaveBatch(ctx, pk, "sess-m", time.Now().Unix(), seedBatch()); err != nil {
+		t.Fatal(err)
+	}
+	q1, q2, _, err := s.Candidates(ctx, []string{"daemon", "port", "nothingmatches"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kw []string
+	for _, c := range onlyPK(q1, pk) {
+		if c.Title == "Daemon port decision" {
+			kw = c.Matched
+		}
+	}
+	if strings.Join(kw, ",") != "daemon,port" {
+		t.Fatalf("keyword matched terms: want [daemon port], got %v", kw)
+	}
+	var exact, part []string
+	for _, c := range onlyPK(q2, pk) {
+		if c.Title == "Daemon port decision" {
+			exact, part = c.Matched, c.Partial
+		}
+	}
+	// "daemon" is only a token of "imem daemon": partial, not an exact name.
+	if len(exact) != 0 || strings.Join(part, ",") != "daemon" {
+		t.Fatalf("want no exact entity and partial [daemon], got exact %v partial %v", exact, part)
+	}
+	_, q2x, _, err := s.Candidates(ctx, []string{"imem daemon"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact = nil
+	for _, c := range onlyPK(q2x, pk) {
+		if c.Title == "Daemon port decision" {
+			exact = c.Matched
+		}
+	}
+	if strings.Join(exact, ",") != "imem daemon" {
+		t.Fatalf("a whole entity name is an exact match, got %v", exact)
+	}
+}
+
+// RELATED edges below minRel are not followed: one chance co-occurrence is
+// not a relation worth widening a search for.
+func TestRelatedHopRespectsMinWeight(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-relw", time.Now().UnixNano())
+	now := time.Now().Unix()
+	pair := []EntityIn{{Name: "zqx seed topic", Type: "topic"}, {Name: "zqx neighbour", Type: "topic"}}
+	neighbourOnly := MemoryIn{Title: "Neighbour only", Content: "Mentions only the zqx neighbour.", Kind: "fact",
+		Entities: []EntityIn{{Name: "zqx neighbour", Type: "topic"}}}
+	once := MemoryIn{Title: "Pair once", Content: "First co-occurrence of the zqx pair.", Kind: "fact", Entities: pair}
+	if _, err := s.SaveBatch(ctx, pk, "sess-r", now, []MemoryIn{neighbourOnly, once}); err != nil {
+		t.Fatal(err)
+	}
+	reach := func(minRel int) bool {
+		_, _, q3, err := s.Candidates(ctx, []string{"zqx seed topic"}, minRel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range onlyPK(q3, pk) {
+			if c.Title == "Neighbour only" {
+				return true
+			}
+		}
+		return false
+	}
+	if !reach(1) || reach(2) {
+		t.Fatalf("a weight-1 edge: followed at minRel 1 (%v), not at 2 (%v)", reach(1), reach(2))
+	}
+	twice := MemoryIn{Title: "Pair twice", Content: "Second co-occurrence of the zqx pair.", Kind: "fact", Entities: pair}
+	if _, err := s.SaveBatch(ctx, pk, "sess-r", now, []MemoryIn{twice}); err != nil {
+		t.Fatal(err)
+	}
+	if !reach(2) {
+		t.Fatal("a weight-2 edge must be followed at minRel 2")
+	}
+}
+
+func TestCountLiveSkipsSuperseded(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	before, err := s.CountLive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk := fmt.Sprintf("/itest/%d-count", time.Now().UnixNano())
+	now := time.Now().Unix()
+	v1 := MemoryIn{Title: "Count me", Content: "first version", Kind: "fact"}
+	v2 := MemoryIn{Title: "Count me", Content: "second version supersedes the first", Kind: "fact"}
+	if _, err := s.SaveBatch(ctx, pk, "sess-c", now, []MemoryIn{v1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveBatch(ctx, pk, "sess-c", now, []MemoryIn{v2}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.CountLive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after-before != 1 {
+		t.Fatalf("two versions, one superseded: live count should grow by 1, grew by %d", after-before)
+	}
+}
+
+func TestByKindPreferences(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-kind", time.Now().UnixNano())
+	pref := MemoryIn{Title: "Prefers stdlib zqk", Content: "User prefers stdlib over frameworks zqk.", Kind: "preference"}
+	fact := MemoryIn{Title: "Some fact zqk", Content: "A plain fact zqk.", Kind: "fact"}
+	if _, err := s.SaveBatch(ctx, pk, "sess-k", time.Now().Unix(), []MemoryIn{pref, fact}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ByKind(ctx, "preference", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := onlyPK(got, pk)
+	if len(mine) != 1 || mine[0].Title != "Prefers stdlib zqk" || mine[0].Kind != "preference" {
+		t.Fatalf("want only the preference, got %+v", mine)
+	}
+}
+
+// Aliases are searchable keywords even on a long memory whose own text
+// already fills the keyword cap, and a re-observation adds new ones.
+func TestSaveIndexesAliases(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-alias", time.Now().UnixNano())
+	now := time.Now().Unix()
+	long := strings.Repeat("filler word zq ", 0)
+	for i := 0; i < 60; i++ {
+		long += fmt.Sprintf("word%02d ", i)
+	}
+	m := MemoryIn{Title: "BCA RDN SFTP switch", Content: long, Kind: "fact", Aliases: []string{"bcardnzq", "rekening dana zq"}}
+	if _, err := s.SaveBatch(ctx, pk, "sess-a", now, []MemoryIn{m}); err != nil {
+		t.Fatal(err)
+	}
+	found := func(tok string) bool {
+		q1, _, _, err := s.Candidates(ctx, []string{tok}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(onlyPK(q1, pk)) == 1
+	}
+	if !found("bcardnzq") || !found("rekening") {
+		t.Fatal("alias tokens must be indexed even past the content's keyword cap")
+	}
+	m.Aliases = []string{"lambatzq"}
+	if _, err := s.SaveBatch(ctx, pk, "sess-a", now, []MemoryIn{m}); err != nil {
+		t.Fatal(err)
+	}
+	if !found("lambatzq") || !found("bcardnzq") {
+		t.Fatal("a re-observation must add its new aliases and keep the old ones")
+	}
+}
+
+// Backfill targets memories that were never aliased (aliases IS NULL — older
+// than the alias extractor), and SetAliases both stores and indexes them.
+func TestAliasBackfillQueries(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	// Not under /itest/: the backfill skips that prefix (live-graph fixtures).
+	pk := fmt.Sprintf("/aliastest/%d", time.Now().UnixNano())
+	if _, err := s.SaveBatch(ctx, pk, "sess-b", time.Now().Unix(), []MemoryIn{
+		{Title: "Old memory zqb", Content: "Saved before aliases existed zqb.", Kind: "fact"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a pre-alias memory: the property is absent, not empty.
+	if err := s.write(ctx, "MATCH (m:Memory {project_key: $pk}) REMOVE m.aliases", map[string]any{"pk": pk}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.MemoriesWithoutAliases(ctx, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	for _, p := range pending {
+		if p.Title == "Old memory zqb" {
+			id = p.ID
+		}
+	}
+	if id == "" {
+		t.Fatal("a memory without aliases must be pending")
+	}
+	if err := s.SetAliases(ctx, id, []string{"memori lama zqb"}); err != nil {
+		t.Fatal(err)
+	}
+	q1, _, _, err := s.Candidates(ctx, []string{"lama"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onlyPK(q1, pk)) != 1 {
+		t.Fatal("SetAliases must index the alias tokens as keywords")
+	}
+	pending, _ = s.MemoriesWithoutAliases(ctx, 5000)
+	for _, p := range pending {
+		if p.ID == id {
+			t.Fatal("an aliased memory is no longer pending")
+		}
+	}
+}
+
+func liveByTitle(t *testing.T, s *Store, pk, title string) (id string, superseded bool, seen int64) {
+	t.Helper()
+	sess := s.driver.NewSession(context.Background(), neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer sess.Close(context.Background())
+	res, err := sess.Run(context.Background(),
+		"MATCH (m:Memory {project_key: $pk, title: $title}) RETURN m.id AS id, coalesce(m.superseded,false) AS sup, m.seen_count AS seen",
+		map[string]any{"pk": pk, "title": title})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Next(context.Background()) {
+		return "", false, 0
+	}
+	rec := res.Record()
+	sup, _ := rec.Get("sup")
+	return recStr(rec, "id"), sup.(bool), recInt(rec, "seen")
+}
+
+// Reconcile "update": the new memory retires the one it replaces, by id,
+// even when the titles differ (the title-based supersede would miss it).
+func TestSaveBatchUpdateSupersedesTarget(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-upd", time.Now().UnixNano())
+	now := time.Now().Unix()
+	if _, err := s.SaveBatch(ctx, pk, "sess-u", now, []MemoryIn{{Title: "Expansion runs live per prompt zqu", Content: "Old decision zqu.", Kind: "decision"}}); err != nil {
+		t.Fatal(err)
+	}
+	oldID, _, _ := liveByTitle(t, s, pk, "Expansion runs live per prompt zqu")
+	out, err := s.SaveBatch(ctx, pk, "sess-u", now, []MemoryIn{{Title: "Expansion moved to index time zqu",
+		Content: "New decision zqu.", Kind: "decision", Op: "update", TargetID: oldID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, sup, _ := liveByTitle(t, s, pk, "Expansion runs live per prompt zqu"); !sup {
+		t.Fatal("the replaced memory must be superseded")
+	}
+	if len(out) != 1 || !out[0].New || !out[0].Updated {
+		t.Fatalf("outcome must say new and updated: %+v", out)
+	}
+}
+
+// Reconcile "noop": the existing memory is re-observed; nothing new is saved.
+func TestSaveBatchNoopReinforcesTarget(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-noop", time.Now().UnixNano())
+	now := time.Now().Unix()
+	if _, err := s.SaveBatch(ctx, pk, "sess-n", now, []MemoryIn{{Title: "Daemon port zqn", Content: "7690 zqn.", Kind: "fact"}}); err != nil {
+		t.Fatal(err)
+	}
+	id, _, _ := liveByTitle(t, s, pk, "Daemon port zqn")
+	out, err := s.SaveBatch(ctx, pk, "sess-n", now+60, []MemoryIn{{Title: "Port again", Content: "brief", Kind: "fact", Op: "noop", TargetID: id}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, seen := liveByTitle(t, s, pk, "Daemon port zqn"); seen != 2 {
+		t.Fatalf("noop must re-observe the target: seen %d", seen)
+	}
+	if other, _, _ := liveByTitle(t, s, pk, "Port again"); other != "" {
+		t.Fatal("noop must not save a new memory")
+	}
+	if len(out) != 1 || out[0].ID != id || out[0].New || out[0].Seen != 2 || out[0].Title != "Daemon port zqn" {
+		t.Fatalf("outcome must describe the reinforced target: %+v", out)
+	}
+}
+
+// B2: feedback counters land on the memories and come back with candidates.
+func TestFeedbackCounters(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-fb", time.Now().UnixNano())
+	now := time.Now().Unix()
+	if _, err := s.SaveBatch(ctx, pk, "sess-f", now, []MemoryIn{{Title: "Feedback target zqf", Content: "Graded memory zqf.", Kind: "fact"}}); err != nil {
+		t.Fatal(err)
+	}
+	id, _, _ := liveByTitle(t, s, pk, "Feedback target zqf")
+	if err := s.ApplyFeedback(ctx, now+100, []Verdict{{ID: id, Verdict: "used"}, {ID: id, Verdict: "used"}, {ID: id, Verdict: "outdated"}, {ID: "nope", Verdict: "used"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkInjected(ctx, []string{id, id}, now+50); err != nil {
+		t.Fatal(err)
+	}
+	q1, _, _, err := s.Candidates(ctx, []string{"zqf"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := onlyPK(q1, pk)
+	if len(got) != 1 || got[0].UsedCount != 2 || got[0].DisputedCount != 1 || got[0].LastUsed != now+100 || got[0].InjectedCount != 2 {
+		t.Fatalf("want used 2, disputed 1, last used now+100, injected 2: %+v", got)
+	}
+}
+
+// C1: an old worktree-keyed memory, once given a repo_key, reports the repo
+// as its project everywhere retrieval looks — without touching its key/hash.
+func TestRepoKeyOverridesProjectKey(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	base := fmt.Sprintf("/itest/%d-repo", time.Now().UnixNano())
+	wt := base + "/.superset/worktrees/abc/feature-x"
+	repo := base + "/registration"
+	if _, err := s.SaveBatch(ctx, wt, "sess-r", time.Now().Unix(), []MemoryIn{
+		{Title: "Worktree fact zqr", Content: "Saved from a worktree zqr.", Kind: "fact"},
+		{Title: "Worktree rule zqr", Content: "A rule from a worktree zqr.", Kind: "rule"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := s.ProjectKeys(ctx)
+	if err != nil || !slices.Contains(keys, wt) {
+		t.Fatalf("project keys must list the worktree key: %v %v", keys, err)
+	}
+	n, err := s.SetRepoKey(ctx, wt, repo)
+	if err != nil || n != 2 {
+		t.Fatalf("want 2 memories re-keyed, got %d %v", n, err)
+	}
+	q1, _, _, err := s.Candidates(ctx, []string{"zqr"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onlyPK(q1, repo)) != 2 || len(onlyPK(q1, wt)) != 0 {
+		t.Fatalf("candidates must report the repo key: %+v", q1)
+	}
+	rules, _ := s.ByKind(ctx, "rule", -1)
+	if len(onlyPK(rules, repo)) != 1 {
+		t.Fatal("rules must report the repo key too")
+	}
+}
+
+func TestSupersedeByKeepsTheKeeper(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-cons", time.Now().UnixNano())
+	now := time.Now().Unix()
+	out, err := s.SaveBatch(ctx, pk, "sess-c", now, []MemoryIn{
+		{Title: "Dup one zqc", Content: "ztauth verification race zqc one.", Kind: "fact", Entities: []EntityIn{{Name: "ztauth zqc"}}},
+		{Title: "Dup two zqc", Content: "ztauth verification race zqc two.", Kind: "fact", Entities: []EntityIn{{Name: "ztauth zqc"}}},
+		{Title: "Canonical zqc", Content: "ztauth verification: race tests zqc.", Kind: "fact"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.SupersedeBy(ctx, out[2].ID, []string{out[0].ID, out[1].ID, out[2].ID})
+	if err != nil || n != 2 {
+		t.Fatalf("want the 2 others superseded, got %d %v", n, err)
+	}
+	if _, sup, _ := liveByTitle(t, s, pk, "Canonical zqc"); sup {
+		t.Fatal("the keeper must stay live")
+	}
+	if _, sup, _ := liveByTitle(t, s, pk, "Dup one zqc"); !sup {
+		t.Fatal("members must be superseded")
+	}
+	live, err := s.LiveMemories(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range live {
+		if m.ProjectKey == pk && m.Title != "Canonical zqc" {
+			t.Fatalf("superseded memories are not live: %+v", m)
+		}
+	}
+}
+
+func TestLiveMemoriesCarryKeywordsAndEntities(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/cons-test/%d", time.Now().UnixNano()) // /itest/ is skipped by LiveMemories
+	if _, err := s.SaveBatch(ctx, pk, "sess-l", time.Now().Unix(), []MemoryIn{
+		{Title: "Jago whitelist zql", Content: "Rows live in master data zql.", Kind: "fact", Entities: []EntityIn{{Name: "Jago Whitelist"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	live, err := s.LiveMemories(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range live {
+		if m.ProjectKey == pk {
+			if !slices.Contains(m.Keywords, "zql") || !slices.Contains(m.Entities, "jago whitelist") {
+				t.Fatalf("want keywords and lowercased entity names: %+v", m)
+			}
+			return
+		}
+	}
+	t.Fatal("the memory must be listed")
+}
+
+// C2 archive: a memory that kept being injected but was never used goes out
+// of retrieval (not deleted).
+func TestArchiveTakesMemoriesOutOfRetrieval(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-arch", time.Now().UnixNano())
+	old := time.Now().Unix() - 90*86400
+	out, err := s.SaveBatch(ctx, pk, "sess-a", old, []MemoryIn{
+		{Title: "Never used zqa", Content: "Injected a lot zqa.", Kind: "rule"},
+		{Title: "Used zqa", Content: "Injected and used zqa.", Kind: "fact"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{out[0].ID, out[1].ID}
+	for i := 0; i < 25; i++ {
+		if err := s.MarkInjected(ctx, ids, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.ApplyFeedback(ctx, old, []Verdict{{ID: out[1].ID, Verdict: "used"}}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := s.CountLive(ctx)
+	cands, err := s.ArchiveCandidates(ctx, 20, time.Now().Unix()-60*86400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mine []string
+	for _, c := range cands {
+		if c.ID == out[0].ID || c.ID == out[1].ID {
+			mine = append(mine, c.Title)
+		}
+	}
+	if strings.Join(mine, ",") != "Never used zqa" {
+		t.Fatalf("only the never-used memory is a candidate, got %v", mine)
+	}
+	if err := s.Archive(ctx, []string{out[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	q1, _, _, _ := s.Candidates(ctx, []string{"zqa"}, 1)
+	rules, _ := s.ByKind(ctx, "rule", -1)
+	after, _ := s.CountLive(ctx)
+	if len(onlyPK(q1, pk)) != 1 || len(onlyPK(rules, pk)) != 0 || after != before-1 {
+		t.Fatalf("an archived memory leaves search, rules and the corpus count: q1 %d rules %d count %d->%d",
+			len(onlyPK(q1, pk)), len(onlyPK(rules, pk)), before, after)
 	}
 }

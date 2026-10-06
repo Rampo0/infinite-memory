@@ -18,6 +18,7 @@ import (
 	"github.com/Rampo0/infinite-memory/internal/backup"
 	"github.com/Rampo0/infinite-memory/internal/config"
 	"github.com/Rampo0/infinite-memory/internal/expand"
+	"github.com/Rampo0/infinite-memory/internal/extract"
 	"github.com/Rampo0/infinite-memory/internal/graph"
 	"github.com/Rampo0/infinite-memory/internal/project"
 	"github.com/Rampo0/infinite-memory/internal/retrieve"
@@ -36,6 +37,14 @@ type server struct {
 	// state that must not be duplicated per request.
 	expander *expand.Expander
 	vocab    *vocabCache
+	corpus   *corpusCache
+	// injections tracks what each session was already shown.
+	injections *injectionLog
+	// byKind fetches every live memory of one kind (func field so handlers
+	// test without Memgraph, the same injection shape as Expander.Run).
+	byKind func(ctx context.Context, kind string) ([]graph.Candidate, error)
+	// saveBatch writes memories (Store.SaveBatch; a func field for tests).
+	saveBatch func(ctx context.Context, pk, sid string, now int64, mems []graph.MemoryIn) ([]graph.SaveOutcome, error)
 
 	schemaMu sync.Mutex
 	schemaOK bool
@@ -64,6 +73,7 @@ func Run(cfg config.Config) error {
 		return err
 	}
 
+	corpus := newCorpusCache(store.CountLive)
 	s := &server{
 		cfg:   cfg,
 		store: store,
@@ -71,13 +81,44 @@ func Run(cfg config.Config) error {
 			Store: store, K: cfg.RetrieveK, MaxContentChars: cfg.MaxMemoryContentChars,
 			SameProjectBoost: cfg.SameProjectBoost, RulesK: cfg.RulesK,
 			SummaryLines: cfg.HookSummaryLines,
+			Corpus:       corpus.Get, MinMatch: cfg.MinMatch, RelatedMinWeight: cfg.RelatedMinWeight,
+			MaxChars: cfg.RetrieveMaxChars,
 		},
-		log: log,
+		corpus:     corpus,
+		injections: newInjectionLog(),
+		byKind: func(ctx context.Context, kind string) ([]graph.Candidate, error) {
+			return store.ByKind(ctx, kind, -1)
+		},
+		saveBatch: store.SaveBatch,
+		log:       log,
+	}
+	if cfg.RulesOnSessionStart {
+		// Standing rules arrive once per session; per prompt only matches.
+		s.retr.RulesK = 0
 	}
 	s.saves = newSaveLog()
 	s.vocab = newVocabCache()
 	worker := NewWorker(store, cfg, log)
 	worker.Saves = s.saves
+	// B1: the extractor sees the 12 existing memories most like the excerpt.
+	similar := retrieve.Retriever{Store: store, K: 12, Corpus: corpus.Get,
+		MinMatch: cfg.MinMatch, RelatedMinWeight: cfg.RelatedMinWeight}
+	worker.Similar = func(ctx context.Context, pk string, tokens []string) ([]extract.Known, error) {
+		scored, err := similar.QueryTokens(ctx, pk, tokens, time.Now().Unix())
+		out := make([]extract.Known, len(scored))
+		for i, m := range scored {
+			out[i] = extract.Known{ID: m.ID, Kind: m.Kind, Title: m.Title, Content: m.Content}
+		}
+		return out, err
+	}
+	// B2: and the memories this session was shown since its last extraction.
+	worker.Shown = func(sid string, since int64) []extract.Known {
+		var out []extract.Known
+		for _, it := range s.injections.Since(sid, since) {
+			out = append(out, extract.Known{ID: it.ID, Kind: it.Kind, Title: it.Title, Content: it.Content})
+		}
+		return out
+	}
 	s.expander = s.newExpander(worker.Runner)
 	s.queue = NewQueue(cfg.Debounce(), worker.Process, log)
 	s.queue.OnPending = s.saves.MarkPending
@@ -85,6 +126,9 @@ func Run(cfg config.Config) error {
 
 	if cfg.BackupEnabled {
 		s.startBackupLoop()
+	}
+	if cfg.ConsolidateEnabled {
+		s.startConsolidateLoop(worker.Runner)
 	}
 
 	// Memgraph may be down at startup: log and keep serving, the schema is
@@ -94,6 +138,10 @@ func Run(cfg config.Config) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("POST /v1/retrieve", s.handleRetrieve)
+	mux.HandleFunc("POST /v1/retrieve/preview", s.handleRetrievePreview)
+	mux.HandleFunc("POST /v1/session-start", s.handleSessionStart)
+	mux.HandleFunc("GET /v1/rules", s.handleRules)
+	mux.HandleFunc("POST /v1/remember", s.handleRemember)
 	mux.HandleFunc("POST /v1/extract", s.handleExtract)
 	mux.HandleFunc("GET /v1/memories", s.handleMemories)
 	mux.HandleFunc("GET /v1/expand", s.handleExpand)
@@ -149,8 +197,22 @@ type retrieveReq struct {
 	SessionID string `json:"session_id"`
 }
 
-// handleRetrieve always answers 200: failures fail open into empty context.
+// handleRetrieve is the UserPromptSubmit path. It always answers 200:
+// failures fail open into empty context.
 func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
+	s.serveRetrieve(w, r, true)
+}
+
+// handleRetrievePreview returns exactly what handleRetrieve would inject, with
+// no side effects: imem eval measures through it, and must never drain a save
+// report a real prompt is waiting to print.
+func (s *server) handleRetrievePreview(w http.ResponseWriter, r *http.Request) {
+	s.serveRetrieve(w, r, false)
+}
+
+// serveRetrieve is the shared retrieve path; live marks a real prompt, the
+// only kind allowed to touch per-session state.
+func (s *server) serveRetrieve(w http.ResponseWriter, r *http.Request, live bool) {
 	empty := map[string]any{"context": "", "count": 0, "summary": "", "memories": 0, "rules": 0}
 	var req retrieveReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
@@ -159,7 +221,10 @@ func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	}
 	// Drained once, up front, and attached to EVERY response below: a
 	// Memgraph-down retrieve must not swallow the user's save report.
-	saved := s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
+	var saved SavedPayload
+	if live {
+		saved = s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
+	}
 	empty["saved"] = saved
 	pk := project.ResolveKey(req.CWD)
 	start := time.Now()
@@ -171,6 +236,7 @@ func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RetrieveTO())
 	defer cancel()
 	retr := *s.retr
+	retr.Exclude = s.injections.Seen(req.SessionID)
 	if len(exp.Added) > 0 {
 		retr.Expand = func(tokens []string) []string { return expand.Merge(tokens, exp.Added) }
 	}
@@ -180,14 +246,180 @@ func (s *server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, empty)
 		return
 	}
+	if live {
+		s.injections.Record(req.SessionID, toInjected(res.Injected))
+		s.markInjected(res.Injected)
+	}
 	s.log.Info("retrieve", "project", pk, "count", res.Memories+res.Rules,
-		"memories", res.Memories, "rules", res.Rules,
+		"memories", res.Memories, "rules", res.Rules, "omitted", res.Omitted,
+		"already_shown", len(retr.Exclude), "chars", len(res.Block), "live", live,
 		"expanded", len(exp.Added), "llm_ms", exp.MS, "ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"context": res.Block, "count": res.Memories + res.Rules,
 		"summary": res.Summary, "memories": res.Memories, "rules": res.Rules,
 		"saved": saved, "expanded": expandedLine(exp),
 	})
+}
+
+type sessionStartReq struct {
+	SessionID string `json:"session_id"`
+	CWD       string `json:"cwd"`
+	Source    string `json:"source"`
+}
+
+// handleSessionStart serves the SessionStart hook: it forgets what the session
+// was shown when that context is gone (startup, /clear, compaction — not a
+// resume), then returns the standing context: this project's rules and the
+// user's preferences, within rules_max_chars. Always 200, failing open.
+func (s *server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
+	empty := map[string]any{"context": "", "rules": 0, "preferences": 0, "omitted": 0}
+	var req sessionStartReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusOK, empty)
+		return
+	}
+	if req.Source != "resume" {
+		s.injections.Reset(req.SessionID)
+	}
+	if !s.cfg.RulesOnSessionStart {
+		writeJSON(w, http.StatusOK, empty)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	rules, err := s.byKind(ctx, "rule")
+	if err != nil {
+		s.log.Warn("session-start rules failed", "err", err)
+		writeJSON(w, http.StatusOK, empty)
+		return
+	}
+	prefs, err := s.byKind(ctx, "preference")
+	if err != nil {
+		s.log.Warn("session-start preferences failed", "err", err)
+	}
+	pk := project.ResolveKey(req.CWD)
+	standing := retrieve.SessionRules(rules, prefs, pk)
+	if s.cfg.RulesK > 0 && len(standing) > s.cfg.RulesK {
+		standing = standing[:s.cfg.RulesK]
+	}
+	if len(standing) == 0 {
+		writeJSON(w, http.StatusOK, empty)
+		return
+	}
+	block, _, shown := retrieve.BuildBlock(pk, nil, standing, s.cfg.MaxMemoryContentChars, s.cfg.RulesMaxChars, time.Now().Unix())
+	nRules, nPrefs := 0, 0
+	for _, c := range shown {
+		if c.Kind == "rule" {
+			nRules++
+		} else {
+			nPrefs++
+		}
+	}
+	s.log.Info("session-start", "project", pk, "source", req.Source, "rules", nRules,
+		"preferences", nPrefs, "omitted", len(standing)-len(shown), "chars", len(block))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"context": block, "rules": nRules, "preferences": nPrefs, "omitted": len(standing) - len(shown),
+	})
+}
+
+// handleRules lists every live rule, this project's first, one line each in
+// the context-block format. `imem rules` prints it; ai-review's prep reads it
+// for its standing-rules file.
+func (s *server) handleRules(w http.ResponseWriter, r *http.Request) {
+	qv := r.URL.Query()
+	pk := project.ResolveKey(qv.Get("cwd"))
+	limit := 0
+	if n, err := strconv.Atoi(qv.Get("limit")); err == nil && n > 0 {
+		limit = n
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rules, err := s.byKind(ctx, "rule")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	sorted := retrieve.SortRules(rules, pk, limit, nil)
+	lines := retrieve.RuleLines(pk, sorted, s.cfg.MaxMemoryContentChars, time.Now().Unix())
+	writeJSON(w, http.StatusOK, map[string]any{"project": pk, "lines": lines, "count": len(lines)})
+}
+
+type rememberReq struct {
+	CWD      string   `json:"cwd"`
+	Title    string   `json:"title"`
+	Content  string   `json:"content"`
+	Kind     string   `json:"kind"`
+	Entities []string `json:"entities"`
+}
+
+var rememberKinds = map[string]bool{"fact": true, "decision": true, "preference": true, "rule": true, "reference": true}
+
+// handleRemember saves one explicit memory from the imem_remember MCP tool,
+// under the caller's project, in a per-day "mcp-" session. It goes through
+// the same SaveBatch as extraction: dedup and same-title supersede apply.
+func (s *server) handleRemember(w http.ResponseWriter, r *http.Request) {
+	var req rememberReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	title, content := strings.TrimSpace(req.Title), strings.TrimSpace(req.Content)
+	kind := strings.ToLower(strings.TrimSpace(req.Kind))
+	if title == "" || content == "" || !rememberKinds[kind] {
+		http.Error(w, "title, content and a valid kind are required", http.StatusBadRequest)
+		return
+	}
+	if len(content) > 1500 {
+		content = content[:1500]
+	}
+	mem := graph.MemoryIn{Title: title, Content: content, Kind: kind}
+	for _, e := range req.Entities {
+		if e = strings.TrimSpace(e); e != "" && len(mem.Entities) < 6 {
+			mem.Entities = append(mem.Entities, graph.EntityIn{Name: e, Type: "topic"})
+		}
+	}
+	pk := project.ResolveKey(req.CWD)
+	now := time.Now()
+	sid := "mcp-" + now.Format("20060102")
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	saved, err := s.saveBatch(ctx, pk, sid, now.Unix(), []graph.MemoryIn{mem})
+	if err != nil || len(saved) == 0 {
+		s.log.Warn("remember failed", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprint(err)})
+		return
+	}
+	s.log.Info("remembered", "project", pk, "kind", kind, "title", title, "new", saved[0].New)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": saved[0].ID, "title": saved[0].Title, "kind": saved[0].Kind,
+		"new": saved[0].New, "seen": saved[0].Seen, "project": pk,
+	})
+}
+
+// markInjected counts the injection on the memories, off the prompt's path.
+func (s *server) markInjected(mems []retrieve.Scored) {
+	if s.store == nil || len(mems) == 0 {
+		return
+	}
+	ids := make([]string, len(mems))
+	for i, m := range mems {
+		ids[i] = m.ID
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.store.MarkInjected(ctx, ids, time.Now().Unix()); err != nil {
+			s.log.Warn("mark injected failed", "err", err)
+		}
+	}()
+}
+
+func toInjected(mems []retrieve.Scored) []injected {
+	out := make([]injected, len(mems))
+	for i, m := range mems {
+		out[i] = injected{ID: m.ID, Title: m.Title, Content: m.Content, Kind: m.Kind}
+	}
+	return out
 }
 
 // expandedLine is the pre-rendered user-facing summary of one expansion, so
@@ -295,9 +527,13 @@ func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ExpandBudget()+2*time.Second)
 	defer cancel()
 	exp := s.expandFor(ctx, pk, prompt)
+	// No relevance floor here: imem search is an explicit query capped at
+	// `limit` (10 for the agents), and dropping weak matches would only cost
+	// the agents recall.
 	retr := &retrieve.Retriever{
 		Store: s.store, K: limit, MaxContentChars: s.cfg.MaxMemoryContentChars,
 		SameProjectBoost: s.cfg.SameProjectBoost, RulesK: 0,
+		Corpus: s.corpus.Get, RelatedMinWeight: s.cfg.RelatedMinWeight,
 	}
 	if len(exp.Added) > 0 {
 		retr.Expand = func(tokens []string) []string { return expand.Merge(tokens, exp.Added) }

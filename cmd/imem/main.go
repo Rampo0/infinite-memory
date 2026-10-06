@@ -11,15 +11,24 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Rampo0/infinite-memory/internal/aliases"
 	"github.com/Rampo0/infinite-memory/internal/backup"
 	"github.com/Rampo0/infinite-memory/internal/client"
 	"github.com/Rampo0/infinite-memory/internal/config"
+	"github.com/Rampo0/infinite-memory/internal/consolidate"
 	"github.com/Rampo0/infinite-memory/internal/daemon"
+	"github.com/Rampo0/infinite-memory/internal/eval"
+	"github.com/Rampo0/infinite-memory/internal/extract"
 	"github.com/Rampo0/infinite-memory/internal/graph"
 	"github.com/Rampo0/infinite-memory/internal/hookio"
+	"github.com/Rampo0/infinite-memory/internal/mcp"
+	"github.com/Rampo0/infinite-memory/internal/project"
 )
 
 func main() {
@@ -41,8 +50,20 @@ func main() {
 		cmdSearch(os.Args[2:])
 	case "expand":
 		cmdExpand(os.Args[2:])
+	case "eval":
+		cmdEval(os.Args[2:])
 	case "entities":
 		cmdEntities(os.Args[2:])
+	case "rules":
+		cmdRules(os.Args[2:])
+	case "backfill-aliases":
+		cmdBackfillAliases(os.Args[2:])
+	case "mcp":
+		cmdMCP()
+	case "migrate-repo-keys":
+		cmdMigrateRepoKeys(os.Args[2:])
+	case "consolidate":
+		cmdConsolidate(os.Args[2:])
 	case "entity":
 		cmdEntity(os.Args[2:])
 	case "backup":
@@ -71,7 +92,14 @@ func usage() {
   imem init                            ensure Memgraph schema, list indexes/constraints
   imem search "query" [--cwd path]     search memories via the daemon
   imem expand "prompt" [--cwd path]    show what the LLM expander would add (no search)
+  imem eval [--file f] [--mode hook|search] [--json]   score retrieval on labelled cases
   imem entities [--project] [--limit N]    list entities by mention count (global by default)
+  imem rules [--cwd path] [--limit N]  every live standing rule, this project first, one per line
+  imem consolidate [--plan|--apply] [--limit N] [--min-jaccard F]   merge near-duplicate memories (lists clusters by default)
+  imem consolidate --archive [--apply]  memories injected 20+ times, never used, unseen 60d+ (archive = out of retrieval)
+  imem migrate-repo-keys [--map old=new]... [--yes]   give worktree-keyed memories their repo (additive, dry-run without --yes)
+  imem mcp                             MCP server on stdio (imem_search, imem_remember); register with claude mcp add
+  imem backfill-aliases [--limit N] [--batch N] [--workers N] [--yes]   index-time aliases for older memories (dry-run without --yes)
   imem entity <name...>                one entity: relations + memories mentioning it
   imem backup                          dump the graph now to the backup dir
   imem backups                         list backups (newest first)
@@ -99,11 +127,18 @@ func hookMain(args []string) {
 	if err != nil {
 		return
 	}
+	// Headless spawns that are not conversations (ignore_cwds): no retrieve,
+	// no extract, not even a status line.
+	if cfg.Ignored(in.CWD) {
+		return
+	}
 
 	switch args[0] {
 	case "user-prompt":
 		prompt := strings.TrimSpace(in.PromptText())
-		if prompt == "" || strings.HasPrefix(prompt, "/") {
+		// Slash commands and background-task notifications are not the user
+		// asking anything; neither is worth a retrieve.
+		if prompt == "" || strings.HasPrefix(prompt, "/") || strings.HasPrefix(prompt, "<task-notification") {
 			return
 		}
 		start := time.Now()
@@ -188,6 +223,29 @@ func hookMain(args []string) {
 			req.BudgetMS = 0
 		}
 		_, _ = client.NotifyExtract(cfg.BaseURL(), req, 500*time.Millisecond)
+	case "session-start":
+		// Standing rules once per session (also after /clear and compaction,
+		// when the earlier copy left the context). Fast path: fail open.
+		start := time.Now()
+		resp, err := client.SessionStart(cfg.BaseURL(), client.SessionStartRequest{
+			SessionID: in.SessionID, CWD: in.CWD, Source: in.Source,
+		}, 2*time.Second)
+		if err != nil {
+			return
+		}
+		block := strings.TrimSpace(resp.Context)
+		msg := ""
+		if cfg.HookShowRetrieved && block != "" {
+			msg = fmt.Sprintf("imem: %d standing rules, %d preferences (%dms)",
+				resp.Rules, resp.Preferences, time.Since(start).Milliseconds())
+			if resp.Omitted > 0 {
+				msg += fmt.Sprintf(" · %d more over budget", resp.Omitted)
+			}
+		}
+		if block == "" && msg == "" {
+			return
+		}
+		_ = hookio.EmitContext(os.Stdout, "SessionStart", block, msg)
 	case "session-end":
 		// Still fire-and-forget: the session is over, so nothing would render.
 		_, _ = client.NotifyExtract(cfg.BaseURL(), client.ExtractRequest{
@@ -296,6 +354,42 @@ func cmdSearch(args []string) {
 	}
 }
 
+// cmdRules prints every live rule, one context-block line each. ai-review's
+// prep reads it (lines starting with "- [rule]") for its standing-rules file,
+// so the output is bare lines and a down daemon exits non-zero.
+func cmdRules(args []string) {
+	cfg := config.Load()
+	vals := url.Values{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--cwd":
+			if i+1 < len(args) {
+				vals.Set("cwd", args[i+1])
+				i++
+			}
+		case "--limit":
+			if i+1 < len(args) {
+				vals.Set("limit", args[i+1])
+				i++
+			}
+		}
+	}
+	if vals.Get("cwd") == "" {
+		cwd, _ := os.Getwd()
+		vals.Set("cwd", cwd)
+	}
+	var out struct {
+		Lines []string `json:"lines"`
+	}
+	if err := getJSON(cfg.BaseURL()+"/v1/rules?"+vals.Encode(), &out, 10*time.Second); err != nil {
+		fmt.Fprintln(os.Stderr, "daemon unreachable:", err)
+		os.Exit(1)
+	}
+	for _, l := range out.Lines {
+		fmt.Println(l)
+	}
+}
+
 func cmdEntities(args []string) {
 	cfg := config.Load()
 	limit, scoped := "50", false
@@ -326,7 +420,9 @@ func cmdEntities(args []string) {
 	}
 	fmt.Printf("entities (%s, %d shown, by mention count):\n", scope, len(out.Entities))
 	for _, e := range out.Entities {
-		fmt.Printf("  %3dx  %-40s [%s]  %s\n", e.Mentions, e.Name, e.Etype, filepath.Base(e.ProjectKey))
+		// Two spaces before "[" even when the name fills the column: agentkit's
+		// ENTITY_LINE (on-call prep) needs them to find where the name ends.
+		fmt.Printf("  %3dx  %-40s  [%s]  %s\n", e.Mentions, e.Name, e.Etype, filepath.Base(e.ProjectKey))
 	}
 }
 
@@ -634,6 +730,12 @@ func orNone(items []string) string {
 }
 
 func cmdHooksJSON() {
+	// Retrieval is milliseconds and fails open; only live expansion
+	// (expand_enabled) needs its budget inside this hook.
+	promptHookTimeout := 10
+	if cfg := config.Load(); cfg.ExpandEnabled {
+		promptHookTimeout = int((cfg.ExpandBudget() + cfg.RetrieveTO()).Seconds()) + 5
+	}
 	exe, err := os.Executable()
 	if err == nil {
 		if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
@@ -645,9 +747,12 @@ func cmdHooksJSON() {
 	snippet := map[string]any{
 		"hooks": map[string]any{
 			"UserPromptSubmit": []any{map[string]any{
-				// Generous because expansion (expand_enabled) spends up to
-				// expand_budget_ms inside this hook before the graph is touched.
-				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook user-prompt", "timeout": 30}},
+				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook user-prompt", "timeout": promptHookTimeout}},
+			}},
+			// Standing rules once per session; also fires after /clear and
+			// compaction, when the earlier copy has left the context.
+			"SessionStart": []any{map[string]any{
+				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook session-start", "timeout": 10}},
 			}},
 			// Stop must be synchronous: an async hook's stdout is discarded,
 			// which would silently drop the "saved" line. timeout covers the
@@ -698,4 +803,549 @@ func postJSON(u string, out any) error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// cmdEval runs labelled retrieval cases (default ~/.config/infinite-memory/
+// eval.jsonl) against the daemon. --json prints the full results for diffing
+// a baseline; otherwise one line per case plus a per-mode summary.
+func cmdEval(args []string) {
+	cfg := config.Load()
+	file := config.ExpandHome("~/.config/infinite-memory/eval.jsonl")
+	asJSON, mode := false, ""
+	// Generous: a daemon with live expansion spends tens of seconds per hook case.
+	timeout := 330 * time.Second
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--file":
+			if i+1 < len(args) {
+				file = args[i+1]
+				i++
+			}
+		case "--mode":
+			if i+1 < len(args) {
+				mode = args[i+1]
+				i++
+			}
+		case "--timeout":
+			if i+1 < len(args) {
+				if d, err := time.ParseDuration(args[i+1]); err == nil {
+					timeout = d
+				}
+				i++
+			}
+		case "--json":
+			asJSON = true
+		}
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "eval cases:", err)
+		os.Exit(2)
+	}
+	cases, err := eval.ParseCases(f)
+	f.Close()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "eval cases:", err)
+		os.Exit(2)
+	}
+
+	rn := eval.Runner{BaseURL: cfg.BaseURL(), Timeout: timeout}
+	var results []eval.Result
+	for _, c := range cases {
+		if mode != "" && c.Mode != mode {
+			continue
+		}
+		r := rn.Run(c)
+		results = append(results, r)
+		if !asJSON {
+			printEvalLine(r)
+		}
+	}
+	summary := eval.Summarize(results)
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]any{"results": results, "summary": summary})
+		return
+	}
+	for _, m := range []string{"hook", "search"} {
+		if s, ok := summary[m]; ok {
+			fmt.Printf("%-6s n=%d  hit %3.0f%%  MRR %.2f  recall %.2f  max chars %d  p50 %dms  p95 %dms\n",
+				m, s.N, s.HitRate*100, s.MRR, s.MeanRecall, s.MaxChars, s.P50MS, s.P95MS)
+		}
+	}
+}
+
+func printEvalLine(r eval.Result) {
+	mark, rank := "miss", "-"
+	if r.Score.Hit {
+		mark, rank = "hit", fmt.Sprint(r.Score.Rank)
+	}
+	line := fmt.Sprintf("%-28s %-6s %-4s rank %-3s recall %.2f  %7d chars  %6dms",
+		truncRunesCLI(r.Name, 28), r.Mode, mark, rank, r.Score.Recall, r.Chars, r.MS)
+	if r.Err != "" {
+		line += "  ERROR " + r.Err
+	}
+	fmt.Println(line)
+}
+
+func truncRunesCLI(s string, n int) string {
+	rs := []rune(s)
+	if len(rs) <= n {
+		return s
+	}
+	return string(rs[:n-1]) + "…"
+}
+
+// cmdBackfillAliases gives memories saved before the extractor produced
+// aliases their index-time aliases: one isolated expand_model spawn per batch.
+// Without --yes it only reports what it would do. Resumable: aliased
+// memories (even with an empty list) are never asked about again.
+func cmdBackfillAliases(args []string) {
+	cfg := config.Load()
+	limit, batch, workers, yes := 0, 10, 6, false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--limit", "--batch", "--workers":
+			if i+1 < len(args) {
+				n, _ := strconv.Atoi(args[i+1])
+				switch {
+				case args[i] == "--limit":
+					limit = n
+				case args[i] == "--batch" && n > 0:
+					batch = n
+				case args[i] == "--workers" && n > 0:
+					workers = n
+				}
+				i++
+			}
+		case "--yes":
+			yes = true
+		}
+	}
+	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "driver:", err)
+		os.Exit(1)
+	}
+	ctx := context.Background()
+	if err := store.EnsureSchema(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "schema:", err)
+		os.Exit(1)
+	}
+	pending, err := store.MemoriesWithoutAliases(ctx, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "memgraph:", err)
+		os.Exit(1)
+	}
+	todo := len(pending)
+	if limit > 0 && limit < todo {
+		todo = limit
+	}
+	calls := (todo + batch - 1) / batch
+	if !yes {
+		fmt.Printf("%d memories have no aliases; would alias %d in %d %s call(s) of %d.\n",
+			len(pending), todo, calls, cfg.ExpandModel, batch)
+		if len(pending) > 0 {
+			first := toAliasItems(pending[:min(batch, len(pending))])
+			preview := aliases.BuildPrompt(first)
+			if len(preview) > 1500 {
+				preview = preview[:1500] + "…"
+			}
+			fmt.Printf("\nfirst prompt:\n%s\n\nre-run with --yes to write.\n", preview)
+		}
+		return
+	}
+
+	runner := extract.NewRunner(cfg)
+	b := aliases.Backfiller{
+		Batch: batch,
+		Apply: store.SetAliases,
+		Run: func(ctx context.Context, prompt, schema, sys string) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
+			defer cancel()
+			return runner.RunSchema(ctx, extract.Request{
+				Prompt: prompt, Schema: schema, SystemPrompt: sys,
+				Model: cfg.ExpandModel, Isolated: true, Effort: "low",
+			})
+		},
+	}
+	start := time.Now()
+	var mu sync.Mutex
+	finished := 0
+	done, failed := b.RunAll(ctx, toAliasItems(pending[:todo]), workers, func(n int, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		finished += n
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "batch failed, left pending: %v\n", err)
+			return
+		}
+		fmt.Printf("aliased %d/%d (%s)\n", finished, todo, time.Since(start).Round(time.Second))
+	})
+	fmt.Printf("done: %d aliased, %d left pending (re-run to resume)\n", done, failed)
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+func toAliasItems(ts []graph.AliasTarget) []aliases.Item {
+	out := make([]aliases.Item, len(ts))
+	for i, t := range ts {
+		out[i] = aliases.Item{ID: t.ID, Title: t.Title, Content: t.Content, Kind: t.Kind}
+	}
+	return out
+}
+
+// cmdMCP serves the imem MCP tools on stdio for the session model. It talks to
+// the daemon over HTTP like the hooks, and does nothing inside an extraction
+// spawn (INFINITE_MEMORY_INTERNAL), which must never touch memory.
+func cmdMCP() {
+	if os.Getenv("INFINITE_MEMORY_INTERNAL") == "1" {
+		return
+	}
+	cfg := config.Load()
+	cwd, _ := os.Getwd()
+	srv := &mcp.Server{
+		Version: "1",
+		Search: func(ctx context.Context, query string, limit int) (string, error) {
+			u := cfg.BaseURL() + "/v1/memories?" + url.Values{
+				"cwd": {cwd}, "q": {query}, "limit": {strconv.Itoa(limit)},
+			}.Encode()
+			var out struct {
+				Memories []struct {
+					Title      string `json:"Title"`
+					Content    string `json:"Content"`
+					Kind       string `json:"Kind"`
+					ProjectKey string `json:"ProjectKey"`
+					LastSeen   int64  `json:"LastSeen"`
+				} `json:"memories"`
+			}
+			if err := getJSON(u, &out, 10*time.Second); err != nil {
+				return "", fmt.Errorf("imem daemon unreachable: %v", err)
+			}
+			if len(out.Memories) == 0 {
+				return "no memories matched " + strconv.Quote(query), nil
+			}
+			var b strings.Builder
+			now := time.Now().Unix()
+			for _, m := range out.Memories {
+				meta := ago(now, m.LastSeen)
+				if p := filepath.Base(m.ProjectKey); p != "" && p != "." && p != filepath.Base(cwd) {
+					meta += ", from " + p
+				}
+				fmt.Fprintf(&b, "- [%s] %s — %s (%s)\n", m.Kind, m.Title, strings.TrimSpace(m.Content), meta)
+			}
+			return strings.TrimRight(b.String(), "\n"), nil
+		},
+		Remember: func(ctx context.Context, in mcp.RememberInput) (string, error) {
+			var out struct {
+				Title   string `json:"title"`
+				Kind    string `json:"kind"`
+				New     bool   `json:"new"`
+				Seen    int64  `json:"seen"`
+				Project string `json:"project"`
+			}
+			body := map[string]any{"cwd": cwd, "title": in.Title, "content": in.Content, "kind": in.Kind, "entities": in.Entities}
+			if err := postJSONBody(cfg.BaseURL()+"/v1/remember", body, &out); err != nil {
+				return "", fmt.Errorf("not saved: %v", err)
+			}
+			state := "new"
+			if !out.New {
+				state = fmt.Sprintf("already known, seen %dx", out.Seen)
+			}
+			return fmt.Sprintf("saved [%s] %s (%s) under %s", out.Kind, out.Title, state, filepath.Base(out.Project)), nil
+		},
+	}
+	if err := srv.Serve(context.Background(), os.Stdin, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "imem mcp:", err)
+		os.Exit(1)
+	}
+}
+
+func postJSONBody(u string, body, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	c := http.Client{Timeout: 10 * time.Second}
+	resp, err := c.Post(u, "application/json", strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+
+// cmdMigrateRepoKeys gives memories saved under a worktree path (before
+// project keys resolved worktrees to their repository) a repo_key, so the
+// same-project boost and standing rules treat them as the repo's. Additive and
+// re-runnable: project_key and hashes never change; undo is REMOVE m.repo_key.
+// Without --yes it only prints the plan.
+func cmdMigrateRepoKeys(args []string) {
+	cfg := config.Load()
+	manual := map[string]string{}
+	yes := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--yes":
+			yes = true
+		case "--map":
+			if i+1 < len(args) {
+				if old, nw, ok := strings.Cut(args[i+1], "="); ok {
+					manual[old] = nw
+				}
+				i++
+			}
+		}
+	}
+	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "driver:", err)
+		os.Exit(1)
+	}
+	ctx := context.Background()
+	keys, err := store.ProjectKeys(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "memgraph:", err)
+		os.Exit(1)
+	}
+	resolve := func(k string) (string, bool) {
+		if _, err := os.Stat(k); err != nil {
+			return "", false
+		}
+		return project.ResolveKey(k), true
+	}
+	// Repo-named worktree groups (worktrees/master-data/...) are found next
+	// to the repositories the live keys resolve to.
+	parents := map[string]bool{}
+	for _, k := range keys {
+		if r, ok := resolve(k); ok {
+			parents[filepath.Dir(r)] = true
+		}
+	}
+	findRepo := func(group, name string) string {
+		// A live worktree in the same group, even one with no memories.
+		roots := map[string]bool{}
+		_ = filepath.WalkDir(group, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() && strings.Count(strings.TrimPrefix(p, group), string(filepath.Separator)) > 3 {
+				return filepath.SkipDir
+			}
+			if !d.IsDir() && d.Name() == ".git" {
+				if r := project.ResolveKey(filepath.Dir(p)); r != filepath.Dir(p) {
+					roots[r] = true
+				}
+			}
+			return nil
+		})
+		if len(roots) == 1 {
+			for r := range roots {
+				return r
+			}
+		}
+		// A repository named like the group, next to the known ones.
+		var hits []string
+		for p := range parents {
+			c := filepath.Join(p, name)
+			if fi, err := os.Stat(filepath.Join(c, ".git")); err == nil && fi.IsDir() {
+				hits = append(hits, c)
+			}
+		}
+		if len(hits) == 1 {
+			return hits[0]
+		}
+		return ""
+	}
+	mapping, unresolved := project.PlanRepoKeys(keys, resolve, findRepo, manual)
+	olds := make([]string, 0, len(mapping))
+	for k := range mapping {
+		olds = append(olds, k)
+	}
+	sort.Strings(olds)
+	home, _ := os.UserHomeDir()
+	short := func(p string) string { return strings.Replace(p, home, "~", 1) }
+	fmt.Printf("%d project keys, %d map to a repository:\n", len(keys), len(mapping))
+	for _, k := range olds {
+		fmt.Printf("  %s -> %s\n", short(k), short(mapping[k]))
+	}
+	if len(unresolved) > 0 {
+		fmt.Printf("\n%d vanished worktree(s) with nothing to infer their repo from (add --map old=new):\n", len(unresolved))
+		for _, k := range unresolved {
+			fmt.Printf("  %s\n", short(k))
+		}
+	}
+	if !yes {
+		fmt.Println("\nre-run with --yes to write (sets repo_key only; project_key and hashes stay).")
+		return
+	}
+	total := 0
+	for _, k := range olds {
+		n, err := store.SetRepoKey(ctx, k, mapping[k])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", short(k), err)
+			os.Exit(1)
+		}
+		total += n
+	}
+	fmt.Printf("\nrepo_key set on %d memories\n", total)
+}
+
+// cmdConsolidate merges near-duplicate memories. By default it only lists
+// the clusters (no model, no writes); --plan asks the model and prints the
+// merges it proposes; --apply also writes them (canonical memory saved,
+// members superseded — never deleted). --archive lists, or with --apply
+// archives, memories that keep being injected and are never used.
+func cmdConsolidate(args []string) {
+	cfg := config.Load()
+	plan, apply, archive := false, false, false
+	limit, workers, minJ := 0, 4, cfg.ConsolidateMinJaccard
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--plan":
+			plan = true
+		case "--apply":
+			apply = true
+		case "--archive":
+			archive = true
+		case "--limit", "--workers":
+			if i+1 < len(args) {
+				n, _ := strconv.Atoi(args[i+1])
+				if args[i] == "--limit" {
+					limit = n
+				} else if n > 0 {
+					workers = n
+				}
+				i++
+			}
+		case "--min-jaccard":
+			if i+1 < len(args) {
+				if f, err := strconv.ParseFloat(args[i+1], 64); err == nil && f > 0 && f <= 1 {
+					minJ = f
+				}
+				i++
+			}
+		}
+	}
+	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "driver:", err)
+		os.Exit(1)
+	}
+	ctx := context.Background()
+
+	if archive {
+		cands, err := store.ArchiveCandidates(ctx, 20, time.Now().Unix()-60*86400)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "memgraph:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%d archive candidate(s) (injected 20+ times, never used, unseen 60+ days):\n", len(cands))
+		ids := make([]string, len(cands))
+		for i, c := range cands {
+			ids[i] = c.ID
+			fmt.Printf("  [%s] %s\n", c.Kind, c.Title)
+		}
+		if apply && len(ids) > 0 {
+			if err := store.Archive(ctx, ids); err != nil {
+				fmt.Fprintln(os.Stderr, "archive:", err)
+				os.Exit(1)
+			}
+			fmt.Printf("archived %d (undo: MATCH (m:Memory) WHERE m.archived REMOVE m.archived)\n", len(ids))
+		}
+		return
+	}
+
+	live, err := store.LiveMemories(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "memgraph:", err)
+		os.Exit(1)
+	}
+	clusters := consolidate.Clusters(consolidate.FromLive(live), minJ, 30, 8)
+	if limit > 0 && limit < len(clusters) {
+		clusters = clusters[:limit]
+	}
+	members := 0
+	for _, c := range clusters {
+		members += len(c)
+	}
+	fmt.Printf("%d live memories, %d near-duplicate cluster(s) covering %d (Jaccard >= %.2f)\n", len(live), len(clusters), members, minJ)
+	if !plan && !apply {
+		for _, c := range clusters {
+			fmt.Println("--")
+			for _, m := range c {
+				fmt.Printf("  %s [%s] %s\n", m.ID, m.Kind, m.Title)
+			}
+		}
+		fmt.Println("\n--plan asks the model which to merge (no writes); --apply also writes.")
+		return
+	}
+
+	runner := extract.NewRunner(cfg)
+	c := consolidate.Consolidator{
+		Run: func(ctx context.Context, prompt, schema, sys string) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, 240*time.Second)
+			defer cancel()
+			return runner.RunSchema(ctx, extract.Request{Prompt: prompt, Schema: schema, SystemPrompt: sys, Isolated: true, Effort: "low"})
+		},
+	}
+	if apply {
+		c.Apply = consolidate.StoreApply(store)
+	}
+	type outcome struct {
+		cluster []consolidate.Mem
+		merges  []consolidate.Merge
+		err     error
+	}
+	jobs := make(chan []consolidate.Mem)
+	results := make(chan outcome)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for cl := range jobs {
+				ms, err := c.Process(ctx, cl)
+				results <- outcome{cl, ms, err}
+			}
+		}()
+	}
+	go func() {
+		for _, cl := range clusters {
+			jobs <- cl
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	merged, retired, failed := 0, 0, 0
+	for o := range results {
+		if o.err != nil {
+			failed++
+			fmt.Fprintf(os.Stderr, "cluster failed: %v\n", o.err)
+		}
+		title := map[string]string{}
+		for _, m := range o.cluster {
+			title[m.ID] = m.Title
+		}
+		for _, m := range o.merges {
+			merged++
+			retired += len(m.IDs)
+			fmt.Printf("\n[%s] %s\n  %s\n", m.Kind, m.Title, m.Content)
+			for _, id := range m.IDs {
+				fmt.Printf("  <- %s\n", title[id])
+			}
+		}
+	}
+	verb := "would merge"
+	if apply {
+		verb = "merged"
+	}
+	fmt.Printf("\n%s %d memories into %d (%d cluster(s) failed)\n", verb, retired, merged, failed)
 }

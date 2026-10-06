@@ -18,6 +18,8 @@ type Input struct {
 	// Prompt is a fallback for older Claude Code builds that used "prompt".
 	Prompt         string `json:"prompt"`
 	StopHookActive bool   `json:"stop_hook_active"`
+	// Source is SessionStart's trigger: startup, resume, clear or compact.
+	Source string `json:"source"`
 }
 
 func Read(r io.Reader) (Input, error) {

@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"github.com/Rampo0/infinite-memory/internal/consolidate"
+	"github.com/Rampo0/infinite-memory/internal/extract"
 	"time"
 
 	"github.com/Rampo0/infinite-memory/internal/backup"
@@ -122,4 +124,41 @@ func (s *server) backupStatus() (backup.Info, string) {
 	s.backupStateMu.Lock()
 	defer s.backupStateMu.Unlock()
 	return s.lastBackup, s.lastBackupErr
+}
+
+// startConsolidateLoop merges near-duplicate memories every
+// consolidate_interval_hours (opt-in: consolidate_enabled). The first run
+// waits a full interval, so a restart never triggers a burst of spawns.
+func (s *server) startConsolidateLoop(runner *extract.Runner) {
+	every := time.Duration(s.cfg.ConsolidateIntervalHours) * time.Hour
+	s.log.Info("consolidate loop started", "interval", every, "min_jaccard", s.cfg.ConsolidateMinJaccard)
+	c := consolidate.Consolidator{
+		Run: func(ctx context.Context, prompt, schema, sys string) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, 180*time.Second)
+			defer cancel()
+			return runner.RunSchema(ctx, extract.Request{Prompt: prompt, Schema: schema, SystemPrompt: sys, Isolated: true, Effort: "low"})
+		},
+		Apply: consolidate.StoreApply(s.store),
+	}
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for range t.C {
+			ctx := context.Background()
+			live, err := s.store.LiveMemories(ctx)
+			if err != nil {
+				s.log.Warn("consolidate: list failed", "err", err)
+				continue
+			}
+			merged := 0
+			for _, cl := range consolidate.Clusters(consolidate.FromLive(live), s.cfg.ConsolidateMinJaccard, 30, 8) {
+				ms, err := c.Process(ctx, cl)
+				if err != nil {
+					s.log.Warn("consolidate: cluster failed", "err", err)
+				}
+				merged += len(ms)
+			}
+			s.log.Info("consolidated", "merges", merged)
+		}
+	}()
 }

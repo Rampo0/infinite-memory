@@ -14,6 +14,10 @@ import (
 type Turn struct {
 	Role string // "user" or "assistant"
 	Text string
+	// Tools summarizes the assistant's tool calls, one line each: a file
+	// path, a Bash description, a tool name — never a command or other
+	// input, which may carry secrets.
+	Tools []string
 }
 
 // envelope mirrors only the transcript JSONL fields we act on; anything else
@@ -32,9 +36,13 @@ type message struct {
 }
 
 type contentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type  string          `json:"type"`
+	Text  string          `json:"text"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
 }
+
+const maxToolsPerTurn = 8
 
 const perMessageClip = 2000
 
@@ -73,7 +81,7 @@ func ReadDelta(path string, fromLine, maxChars int) (turns []Turn, totalLines in
 	total := 0
 	cut := len(turns)
 	for i := len(turns) - 1; i >= 0; i-- {
-		total += len(turns[i].Text)
+		total += len(turns[i].Text) + len(strings.Join(turns[i].Tools, "; "))
 		if maxChars > 0 && total > maxChars {
 			break
 		}
@@ -100,13 +108,61 @@ func parseLine(line []byte) (Turn, bool) {
 
 	text := extractText(msg.Content)
 	text = strings.TrimSpace(text)
-	if text == "" || isPlumbing(text) {
+	var tools []string
+	if env.Type == "assistant" {
+		tools = toolSummaries(msg.Content)
+	}
+	if (text == "" && len(tools) == 0) || isPlumbing(text) {
 		return Turn{}, false
 	}
 	if len(text) > perMessageClip {
 		text = text[:perMessageClip]
 	}
-	return Turn{Role: env.Type, Text: text}, true
+	return Turn{Role: env.Type, Text: text, Tools: tools}, true
+}
+
+// toolSummaries renders tool_use blocks as one safe line each. Only fields
+// known to be harmless are read: file paths, Bash's human description, a
+// sub-agent's description. Everything else is reduced to the tool name.
+func toolSummaries(raw json.RawMessage) []string {
+	var blocks []contentBlock
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil
+	}
+	var out []string
+	for _, b := range blocks {
+		if b.Type != "tool_use" || b.Name == "" || len(out) == maxToolsPerTurn {
+			continue
+		}
+		var in struct {
+			FilePath     string `json:"file_path"`
+			NotebookPath string `json:"notebook_path"`
+			Description  string `json:"description"`
+		}
+		_ = json.Unmarshal(b.Input, &in)
+		line := b.Name
+		switch b.Name {
+		case "Read", "Edit", "Write", "MultiEdit", "NotebookEdit":
+			if p := firstNonEmpty(in.FilePath, in.NotebookPath); p != "" {
+				line += " " + p
+			}
+		case "Bash", "Agent", "Task":
+			if d := strings.TrimSpace(in.Description); d != "" {
+				line += ": " + clip(d, 100)
+			}
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // extractText handles both content shapes: plain string (typed prompts) and

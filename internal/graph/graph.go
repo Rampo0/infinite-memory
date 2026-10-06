@@ -50,6 +50,7 @@ var schemaStatements = []string{
 	"CREATE INDEX ON :Project(key)",
 	"CREATE INDEX ON :Session(id)",
 	"CREATE INDEX ON :Memory(hash)",
+	"CREATE INDEX ON :Memory(id)",
 	"CREATE INDEX ON :Memory(project_key)",
 	"CREATE INDEX ON :Memory(title_lc)",
 	"CREATE INDEX ON :Entity(key)",
@@ -115,6 +116,22 @@ func recStr(rec *neo4j.Record, key string) string {
 	v, _ := rec.Get(key)
 	s, _ := v.(string)
 	return s
+}
+
+// recStrs reads a list-of-strings column; absent or mistyped yields nil.
+func recStrs(rec *neo4j.Record, key string) []string {
+	v, ok := rec.Get(key)
+	if !ok {
+		return nil
+	}
+	items, _ := v.([]any)
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		if str, ok := it.(string); ok && str != "" {
+			out = append(out, str)
+		}
+	}
+	return out
 }
 
 func recInt(rec *neo4j.Record, key string) int64 {
