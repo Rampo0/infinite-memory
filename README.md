@@ -154,6 +154,10 @@ every escaped statement.
   (default 90s) the daemon answers `running`, the extraction finishes in the background,
   and its report prints at the next prompt. `hook_flush_on_stop: false` restores the old
   fire-and-forget behaviour, where `SessionEnd` and the 45s debounce do the saving.
+- **Agent transcripts**: a transcript outside `~/.claude/projects` is only accepted from
+  a configured `agent_roots` directory (symlinks resolved), is extracted in isolated mode
+  (no MCP servers, settings or tools), and never saves a `rule` or `preference` — those
+  become `fact`. A bot writes after reading untrusted text; rules reach every session.
 - **Recursion guards**: spawned claude runs with `--settings '{"disableAllHooks":true}'`
   and `INFINITE_MEMORY_INTERNAL=1`; every hook subcommand exits instantly when that env
   var is set. `--bare` is deliberately NOT used — it disables subscription OAuth.

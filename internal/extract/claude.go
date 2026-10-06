@@ -120,10 +120,12 @@ type Request struct {
 }
 
 // Run executes one extraction and returns the model's raw result text.
-// The caller owns the context deadline (120s recommended).
-func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
+// The caller owns the context deadline (120s recommended). isolated is for
+// transcripts that are not the user's own (see Request.Isolated).
+func (r *Runner) Run(ctx context.Context, prompt string, isolated bool) (string, error) {
 	return r.RunSchema(ctx, Request{
 		Prompt: prompt, Schema: ExtractionSchema, SystemPrompt: systemPrompt, Append: true,
+		Isolated: isolated,
 	})
 }
 

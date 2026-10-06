@@ -254,7 +254,7 @@ func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if !validTranscriptPath(req.TranscriptPath) {
+	if !validTranscriptPath(req.TranscriptPath, s.cfg.AgentRoots) {
 		http.Error(w, "invalid transcript_path", http.StatusBadRequest)
 		return
 	}
@@ -268,19 +268,18 @@ func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "saved": saved})
 }
 
-// validTranscriptPath only accepts real files under ~/.claude/projects —
-// the daemon must never be told to read arbitrary files.
-func validTranscriptPath(p string) bool {
+// validTranscriptPath only accepts real files under ~/.claude/projects or a
+// configured agent root — the daemon must never be told to read arbitrary files.
+func validTranscriptPath(p string, agentRoots []string) bool {
 	if p == "" {
 		return false
 	}
 	clean := filepath.Clean(p)
-	root := config.ClaudeProjectsDir() + string(filepath.Separator)
-	if !strings.HasPrefix(clean, root) {
+	fi, err := os.Stat(clean)
+	if err != nil || !fi.Mode().IsRegular() {
 		return false
 	}
-	fi, err := os.Stat(clean)
-	return err == nil && fi.Mode().IsRegular()
+	return fromClaudeProjects(clean) || agentRoot(clean, agentRoots) != ""
 }
 
 func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
@@ -372,7 +371,7 @@ func (s *server) handleFlush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if req.TranscriptPath != "" && !validTranscriptPath(req.TranscriptPath) {
+	if req.TranscriptPath != "" && !validTranscriptPath(req.TranscriptPath, s.cfg.AgentRoots) {
 		http.Error(w, "invalid transcript_path", http.StatusBadRequest)
 		return
 	}

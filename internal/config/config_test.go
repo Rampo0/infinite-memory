@@ -141,6 +141,20 @@ func TestExpandBudgetFallsBackToDefault(t *testing.T) {
 	}
 }
 
+// agent_roots are matched against real paths, so "~" must be expanded at load.
+func TestLoadExpandsAgentRoots(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(`{"agent_roots":["~/.on-call/imem"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("IMEM_CONFIG", p)
+	home, _ := os.UserHomeDir()
+	got := Load().AgentRoots
+	if len(got) != 1 || got[0] != filepath.Join(home, ".on-call", "imem") {
+		t.Fatalf("AgentRoots = %v", got)
+	}
+}
+
 // Sharing extract_model would drag a large, slow model onto the retrieval path.
 func TestExpandModelIsIndependent(t *testing.T) {
 	got := loadWith(t, `{"extract_model": "claude-opus-5"}`)

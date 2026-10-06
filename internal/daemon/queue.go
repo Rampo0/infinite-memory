@@ -337,14 +337,22 @@ func (w *Worker) process(j Job) (SaveReport, error) {
 	spawnCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	w.Log.Info("extracting", "session", j.SessionID, "turns", len(turns), "from_line", cur, "to_line", total, "model", w.Runner.Model)
-	raw, err := w.Runner.Run(spawnCtx, prompt)
+	// Fails closed: anything not from ~/.claude/projects is an agent's
+	// transcript, even a path that no longer resolves into an agent root since
+	// it was validated. It is extracted isolated and its rules are demoted.
+	foreign := !fromClaudeProjects(j.TranscriptPath)
+
+	w.Log.Info("extracting", "session", j.SessionID, "turns", len(turns), "from_line", cur, "to_line", total, "model", w.Runner.Model, "isolated", foreign)
+	raw, err := w.Runner.Run(spawnCtx, prompt, foreign)
 	if err != nil {
 		return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("claude: %w", err))
 	}
 	mems, err := extract.ParseMemories(raw)
 	if err != nil {
 		return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("parse: %w", err))
+	}
+	if foreign {
+		demoteAgentKinds(mems)
 	}
 	if len(mems) > 0 {
 		saved, err := w.Store.SaveBatch(ctx, pk, j.SessionID, now, mems)

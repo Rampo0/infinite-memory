@@ -22,6 +22,7 @@
   "hook_saved_lines": 6,
   "hook_flush_on_stop": true,
   "stop_flush_budget_ms": 90000,
+  "agent_roots": [],
   "backup_enabled": true,
   "backup_interval_hours": 4,
   "backup_keep": 2,

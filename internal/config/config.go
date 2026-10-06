@@ -67,6 +67,12 @@ type Config struct {
 	// StopFlushBudgetMS caps how long the daemon holds the flush response
 	// before answering "running" and finishing in the background.
 	StopFlushBudgetMS int `json:"stop_flush_budget_ms"`
+	// AgentRoots are transcript directories inside agent homes (e.g.
+	// ~/.on-call/imem) where an agent's deterministic code may hand the daemon
+	// a transcript outside ~/.claude/projects. Memories
+	// from those transcripts are never saved as rules or preferences: a bot
+	// writes after reading untrusted input, and rules reach every session.
+	AgentRoots []string `json:"agent_roots"`
 	// Backup* control the periodic Cypher dump the daemon writes outside the
 	// Docker volume, so losing the volume does not lose the graph.
 	BackupEnabled       bool   `json:"backup_enabled"`
@@ -135,6 +141,9 @@ func Load() Config {
 		return cfg
 	}
 	_ = json.Unmarshal(data, &cfg)
+	for i, r := range cfg.AgentRoots {
+		cfg.AgentRoots[i] = ExpandHome(r)
+	}
 	cfg.RetrieveK = normLimit(cfg.RetrieveK, Default().RetrieveK)
 	if cfg.DebounceSeconds <= 0 {
 		cfg.DebounceSeconds = Default().DebounceSeconds
