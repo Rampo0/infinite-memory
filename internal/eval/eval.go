@@ -31,11 +31,12 @@ const (
 // Case is one labelled query. Expect holds case-insensitive substrings of the
 // titles that a good retrieval must surface.
 type Case struct {
-	Name   string   `json:"name"`
-	Mode   string   `json:"mode"` // "hook" or "search"
-	Prompt string   `json:"prompt"`
-	CWD    string   `json:"cwd"`
-	Expect []string `json:"expect"`
+	Name    string   `json:"name"`
+	Mode    string   `json:"mode"` // "hook" or "search"
+	Prompt  string   `json:"prompt"`
+	Context string   `json:"context,omitempty"`
+	CWD     string   `json:"cwd"`
+	Expect  []string `json:"expect"`
 }
 
 // CaseScore is how one result list fared against its expectations. Rank is
@@ -212,7 +213,7 @@ func (rn Runner) Run(c Case) Result {
 // endpoint with a session id no hook ever uses, so no user's save report is
 // drained by the measurement.
 func (rn Runner) hookBlock(c Case) (string, error) {
-	body, _ := json.Marshal(map[string]string{"cwd": c.CWD, "prompt": c.Prompt, "session_id": "imem-eval"})
+	body, _ := json.Marshal(map[string]string{"cwd": c.CWD, "prompt": c.Prompt, "context": c.Context, "session_id": "imem-eval"})
 	var out struct {
 		Context string `json:"context"`
 	}

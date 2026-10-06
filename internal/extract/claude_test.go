@@ -173,6 +173,15 @@ func TestBuildPromptAsksForAliases(t *testing.T) {
 	}
 }
 
+func TestBuildPromptForbidsCustomerPersonalData(t *testing.T) {
+	p := BuildPrompt("/p", nil, []Turn{{Role: "user", Text: "x"}})
+	for _, want := range []string{"Never record personal data", "NIK", "registration or account codes"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("extraction prompt must forbid customer personal data (%q missing)", want)
+		}
+	}
+}
+
 func TestExtractionSchemaHasOpsAndFeedback(t *testing.T) {
 	var schema struct {
 		Properties struct {

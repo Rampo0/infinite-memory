@@ -727,3 +727,33 @@ func TestAliasOnlyMatchWeighsHalf(t *testing.T) {
 		t.Fatal("alias-only terms must weigh less than the same terms in the text")
 	}
 }
+
+func TestSessionRulesPinnedFirst(t *testing.T) {
+	rules := []graph.Candidate{
+		{ID: "local-hot", Kind: "rule", ProjectKey: "/ws/here", SeenCount: 9, LastSeen: 90},
+		{ID: "constitution", Kind: "rule", ProjectKey: "/scratch", SeenCount: 1, LastSeen: 10, Pinned: true},
+		{ID: "foreign", Kind: "rule", ProjectKey: "/other", SeenCount: 5, LastSeen: 50},
+	}
+	prefs := []graph.Candidate{
+		{ID: "pref-local", Kind: "preference", ProjectKey: "/ws/here", SeenCount: 1, LastSeen: 10},
+		{ID: "pref-pinned", Kind: "preference", ProjectKey: "/other", SeenCount: 2, LastSeen: 20, Pinned: true},
+	}
+	var ids []string
+	for _, c := range SessionRules(rules, prefs, "/ws/here") {
+		ids = append(ids, c.ID)
+	}
+	if want := "pref-pinned,constitution,local-hot,pref-local,foreign"; strings.Join(ids, ",") != want {
+		t.Fatalf("want %s, got %s", want, strings.Join(ids, ","))
+	}
+}
+
+func TestSortRulesPinnedBeatProjectAndCap(t *testing.T) {
+	rules := []graph.Candidate{
+		{ID: "local", Kind: "rule", ProjectKey: "/here", SeenCount: 9, LastSeen: 90},
+		{ID: "pinned", Kind: "rule", ProjectKey: "/other", SeenCount: 1, LastSeen: 1, Pinned: true},
+	}
+	out := SortRules(rules, "/here", 1, nil)
+	if len(out) != 1 || out[0].ID != "pinned" {
+		t.Fatalf("a pinned rule must survive the cap ahead of local ones, got %+v", out)
+	}
+}

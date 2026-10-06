@@ -203,7 +203,7 @@ func TestSessionStartInjectsRepoRulesAndPreferences(t *testing.T) {
 // context, so they may be injected again; a resume keeps them.
 func TestSessionStartResetsInjectionsOnClearOrCompact(t *testing.T) {
 	s := rulesServer(t, config.Config{RulesOnSessionStart: true, RulesMaxChars: 8000})
-	for source, keep := range map[string]bool{"resume": true, "compact": false, "clear": false, "startup": false} {
+	for source, keep := range map[string]bool{"resume": true, "subagent": true, "compact": false, "clear": false, "startup": false} {
 		s.injections.Record("s1", []injected{{ID: "m1"}})
 		sessionStart(s, "s1", source)
 		if got := s.injections.Seen("s1")["m1"]; got != keep {
@@ -235,6 +235,45 @@ func TestRulesEndpointLines(t *testing.T) {
 	if len(out.Lines) != 2 || !strings.HasPrefix(out.Lines[0], "- [rule] Local rule — ") ||
 		!strings.HasPrefix(out.Lines[1], "- [rule] Foreign rule — x (") {
 		t.Fatalf("want both rules, this project first, as block lines: %q", out.Lines)
+	}
+}
+
+func pinFirstRule(s *server) {
+	base := s.byKind
+	s.byKind = func(ctx context.Context, kind string) ([]graph.Candidate, error) {
+		cs, err := base(ctx, kind)
+		out := append([]graph.Candidate(nil), cs...)
+		if kind == "rule" {
+			out[0].Pinned = true
+		}
+		return out, err
+	}
+}
+
+func TestRulesEndpointPinnedOnly(t *testing.T) {
+	s := rulesServer(t, config.Config{MaxMemoryContentChars: 400})
+	pinFirstRule(s)
+	w := httptest.NewRecorder()
+	s.handleRules(w, httptest.NewRequest(http.MethodGet, "/v1/rules?cwd=/here&pinned=1", nil))
+	var out struct {
+		Lines []string `json:"lines"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Lines) != 1 || !strings.HasPrefix(out.Lines[0], "- [rule] Foreign rule") {
+		t.Fatalf("pinned=1 must list only pinned rules: %q", out.Lines)
+	}
+}
+
+func TestSessionStartPutsPinnedFirst(t *testing.T) {
+	s := rulesServer(t, config.Config{RulesOnSessionStart: true, RulesMaxChars: 8000, MaxMemoryContentChars: 400})
+	pinFirstRule(s)
+	block, _ := sessionStart(s, "s1", "startup")["context"].(string)
+	pinned := strings.Index(block, "- [rule] Foreign rule")
+	local := strings.Index(block, "- [rule] Local rule")
+	if pinned < 0 || local < 0 || pinned > local {
+		t.Fatalf("a pinned rule from another repo must come before this repo's rules:\n%s", block)
 	}
 }
 
@@ -305,5 +344,47 @@ func TestRememberClipsContent(t *testing.T) {
 	postRemember(s, map[string]any{"cwd": "/c", "title": "t", "content": strings.Repeat("x", 4000), "kind": "fact"})
 	if len(got.mems[0].Content) != 1500 {
 		t.Fatalf("content must be clipped to 1500, got %d", len(got.mems[0].Content))
+	}
+}
+
+func TestContextPlanUsesTheConversationForWeakPrompts(t *testing.T) {
+	ctx := "verify the imem retrieval spec\nhooks inject memories per prompt"
+	cases := []struct {
+		prompt          string
+		first, fallback bool
+	}{
+		{"lanjut", true, false},
+		{"fix that", true, false},
+		{"jago syariah connect akun stockbit", false, true},
+	}
+	for _, c := range cases {
+		first, fallback := contextPlan(retrieveReq{Prompt: c.prompt, Context: ctx})
+		if (len(first) > 0) != c.first || (len(fallback) > 0) != c.fallback {
+			t.Fatalf("%q: first=%v fallback=%v", c.prompt, first, fallback)
+		}
+	}
+	if first, fallback := contextPlan(retrieveReq{Prompt: "lanjut"}); first != nil || fallback != nil {
+		t.Fatal("no context, no extra terms")
+	}
+}
+
+func TestMergeTermsAppendsAfterThePromptTokens(t *testing.T) {
+	if mergeTerms(nil, nil) != nil {
+		t.Fatal("nothing to add must leave Expand nil")
+	}
+	got := mergeTerms([]string{"llm"}, []string{"imem"})([]string{"lanjut"})
+	if strings.Join(got, ",") != "lanjut,llm,imem" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestExtractCarriesTheHeadlessFlag(t *testing.T) {
+	root := t.TempDir()
+	path := agentkitTranscript(t, root, "headless.jsonl")
+	rec := &jobRecorder{}
+	s := extractServer(t, []string{root}, rec)
+	postExtract(s, map[string]any{"session_id": "h1", "transcript_path": path, "cwd": "/c", "source": "session_end", "agent": true})
+	if jobs := rec.waitFor(t, 1); !jobs[0].Agent {
+		t.Fatalf("an agent extract must reach the worker flagged, got %+v", jobs[0])
 	}
 }

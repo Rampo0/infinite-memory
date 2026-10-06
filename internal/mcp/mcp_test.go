@@ -165,3 +165,34 @@ func TestPingAnswersEmpty(t *testing.T) {
 		t.Fatalf("ping must answer {}, got %+v", got)
 	}
 }
+
+func TestReadOnlyServesSearchOnly(t *testing.T) {
+	s := &Server{ReadOnly: true, Remember: func(context.Context, RememberInput) (string, error) { return "saved", nil }}
+	got := serve(t, s, `{"jsonrpc":"2.0","id":"a","method":"tools/list"}`, call("imem_remember", `{"title":"t","content":"c","kind":"fact"}`))
+	var res struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(got[0].Result, &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Tools) != 1 || res.Tools[0].Name != "imem_search" {
+		t.Fatalf("read-only must list imem_search alone, got %+v", res.Tools)
+	}
+	if text, isErr := toolText(t, got[1]); !isErr || !strings.Contains(text, "unknown tool") {
+		t.Fatalf("read-only must refuse imem_remember, got %q", text)
+	}
+}
+
+func TestInstructionsAskForSearchEveryTurn(t *testing.T) {
+	for _, s := range []*Server{{}, {ReadOnly: true}} {
+		got := serve(t, s, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`)
+		var res struct {
+			Instructions string `json:"instructions"`
+		}
+		if err := json.Unmarshal(got[0].Result, &res); err != nil || !strings.Contains(res.Instructions, "call imem_search") {
+			t.Fatalf("instructions must ask for imem_search (readOnly=%v): %q", s.ReadOnly, res.Instructions)
+		}
+	}
+}

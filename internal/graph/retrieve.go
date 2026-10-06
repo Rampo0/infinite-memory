@@ -24,6 +24,7 @@ type Candidate struct {
 	DisputedCount int64 `json:",omitempty"`
 	LastUsed      int64 `json:",omitempty"`
 	InjectedCount int64 `json:",omitempty"`
+	Pinned        bool  `json:",omitempty"`
 	// Matched lists the query terms (keyword query) or entity names (entity
 	// query) this memory matched — the retriever weighs each by its idf.
 	Matched []string `json:",omitempty"`
@@ -117,6 +118,7 @@ func scanCandidates(ctx context.Context, res neo4j.ResultWithContext) ([]Candida
 			DisputedCount: recInt(rec, "disputedCount"),
 			LastUsed:      recInt(rec, "lastUsed"),
 			InjectedCount: recInt(rec, "injectedCount"),
+			Pinned:        recBool(rec, "pinned"),
 			Partial:       dedupe(recStrs(rec, "partial")),
 			ViaAlias:      recStrs(rec, "viaAlias"),
 		})
@@ -176,7 +178,7 @@ RETURN m.id AS id, m.title AS title, m.content AS content, m.kind AS kind,
        coalesce(m.repo_key, m.project_key) AS pk, m.last_seen_at AS lastSeen, m.seen_count AS seenCount,
        coalesce(m.used_count, 0) AS usedCount, coalesce(m.disputed_count, 0) AS disputedCount,
        coalesce(m.last_used_at, 0) AS lastUsed, coalesce(m.injected_count, 0) AS injectedCount,
-       0 AS hits`
+       coalesce(m.pinned, false) AS pinned, 0 AS hits`
 
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)

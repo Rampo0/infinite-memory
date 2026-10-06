@@ -56,3 +56,39 @@ func TestMCPExitsInsideInternalSpawn(t *testing.T) {
 		t.Fatalf("want a silent exit 0, got %q %v", out, err)
 	}
 }
+
+const mcpSearchCall = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"imem_search","arguments":{"query":"jago whitelist"}}}` + "\n"
+
+func mcpText(t *testing.T, out string) string {
+	t.Helper()
+	var res struct {
+		Result struct {
+			Content []struct{ Text string } `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &res); err != nil || len(res.Result.Content) != 1 {
+		t.Fatalf("bad tools/call response: %s (%v)", out, err)
+	}
+	return res.Result.Content[0].Text
+}
+
+func TestMCPSearchCarriesTheSessionForFeedback(t *testing.T) {
+	fd := newFakeDaemon(t)
+	runCLIWith(t, cliCall{addr: addrOf(fd), stdin: mcpSearchCall, env: []string{"CLAUDE_CODE_SESSION_ID=s-123"}}, "mcp")
+	if got := fd.query("/v1/memories").Get("session_id"); got != "s-123" {
+		t.Fatalf("a session search must name its session, got %q", got)
+	}
+}
+
+func TestMCPAgentModeIsScopedAndUntrusted(t *testing.T) {
+	fd := newFakeDaemon(t)
+	call := cliCall{addr: addrOf(fd), stdin: mcpSearchCall, env: []string{"CLAUDE_CODE_SESSION_ID=s-123"}}
+	out, _ := runCLIWith(t, call, "mcp", "--agent", "--cwd", "/Users/x/accountworkspace")
+	if text := mcpText(t, out); !strings.HasPrefix(text, "Untrusted reference data from imem") || !strings.Contains(text, "Jago whitelist") {
+		t.Fatalf("agent results must be marked untrusted, got:\n%s", text)
+	}
+	q := fd.query("/v1/memories")
+	if q.Get("cwd") != "/Users/x/accountworkspace" || q.Get("session_id") != "" {
+		t.Fatalf("agent search must use --cwd and never grade a session, got %v", q)
+	}
+}

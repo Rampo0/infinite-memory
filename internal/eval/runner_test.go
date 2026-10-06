@@ -99,3 +99,22 @@ func TestRunnerSearchDecodesScored(t *testing.T) {
 		t.Fatalf("want limit 10 and a rank-2 hit, got limit %q %+v", gotLimit, res)
 	}
 }
+
+func TestRunnerHookSendsTheCaseContext(t *testing.T) {
+	var got string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/retrieve/preview", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Context string `json:"context"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		got = req.Context
+		_ = json.NewEncoder(w).Encode(map[string]any{"context": ""})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	Runner{BaseURL: srv.URL, Timeout: 5 * time.Second}.Run(Case{Name: "c", Mode: "hook", Prompt: "lanjut", Context: "imem spec"})
+	if got != "imem spec" {
+		t.Fatalf("a follow-up case must carry its conversation context, got %q", got)
+	}
+}

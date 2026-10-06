@@ -107,3 +107,21 @@ func TestDemoteAgentKinds(t *testing.T) {
 		}
 	}
 }
+
+func TestHeadlessSessionsAreForeignEvenUnderClaudeProjects(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	own := filepath.Join(home, ".claude", "projects", "-Users-x-repo", "s.jsonl")
+	cases := []struct {
+		job  Job
+		want bool
+	}{
+		{Job{TranscriptPath: own}, false},
+		{Job{TranscriptPath: own, Agent: true}, true},
+		{Job{TranscriptPath: filepath.Join(home, ".on-call", "imem", "x.jsonl")}, true},
+	}
+	for _, c := range cases {
+		if got := isForeign(c.job); got != c.want {
+			t.Fatalf("%+v: foreign=%v, want %v", c.job, got, c.want)
+		}
+	}
+}

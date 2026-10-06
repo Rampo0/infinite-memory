@@ -961,3 +961,38 @@ func TestReindexRewritesTokenLists(t *testing.T) {
 		t.Fatalf("reindexed lists must drive retrieval: %+v", onlyPK(q1, pk))
 	}
 }
+
+func TestPinRulesAndPreferencesOnly(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d-pins", time.Now().UnixNano())
+	mems := []MemoryIn{
+		{Title: "Pinned constitution " + pk, Content: "Functions under 60 lines.", Kind: "rule"},
+		{Title: "Pinned fact " + pk, Content: "The daemon listens on 7690.", Kind: "fact"},
+	}
+	if _, err := s.SaveBatch(ctx, pk, "sess-pin", time.Now().Unix(), mems); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := s.PinTargets(ctx, "pinned constitution "+pk)
+	if err != nil || len(targets) != 1 || targets[0].Kind != "rule" || targets[0].Pinned {
+		t.Fatalf("want one unpinned rule target, got %+v (%v)", targets, err)
+	}
+	if facts, _ := s.PinTargets(ctx, "pinned fact "+pk); len(facts) != 0 {
+		t.Fatalf("facts are not pinnable, got %+v", facts)
+	}
+	if err := s.SetPinned(ctx, targets[0].ID, true); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := s.Rules(ctx, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range onlyPK(rules, pk) {
+		if r.ID == targets[0].ID && !r.Pinned {
+			t.Fatalf("pin did not stick: %+v", r)
+		}
+	}
+	if again, _ := s.PinTargets(ctx, targets[0].ID); len(again) != 1 || !again[0].Pinned {
+		t.Fatalf("an exact id must find the pinned rule, got %+v", again)
+	}
+}

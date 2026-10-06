@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Rampo0/infinite-memory/internal/client"
+	"github.com/Rampo0/infinite-memory/internal/graph"
 )
 
 // savedMessage is the only place the save side turns into user-facing text, so
@@ -51,5 +52,18 @@ func TestSavedMessageAppendsSummary(t *testing.T) {
 	}
 	if !strings.HasPrefix(lines[1], "  [fact]") {
 		t.Fatalf("summary should follow verbatim, got %q", lines[1])
+	}
+}
+
+func TestPickPinTarget(t *testing.T) {
+	ts := []graph.PinTarget{{ID: "a1", Title: "Code constitution"}, {ID: "b2", Title: "Code constitution limits"}}
+	if got, ok := pickPinTarget(ts, "b2"); !ok || got.ID != "b2" {
+		t.Fatalf("an exact id wins over ambiguity, got %+v %v", got, ok)
+	}
+	if _, ok := pickPinTarget(ts, "constitution"); ok {
+		t.Fatal("an ambiguous title must not pick one")
+	}
+	if got, ok := pickPinTarget(ts[:1], "constitution"); !ok || got.ID != "a1" {
+		t.Fatalf("a single match is picked, got %+v %v", got, ok)
 	}
 }

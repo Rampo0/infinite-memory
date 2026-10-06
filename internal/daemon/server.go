@@ -195,6 +195,7 @@ type retrieveReq struct {
 	CWD       string `json:"cwd"`
 	Prompt    string `json:"prompt"`
 	SessionID string `json:"session_id"`
+	Context   string `json:"context"`
 }
 
 // handleRetrieve is the UserPromptSubmit path. It always answers 200:
@@ -237,10 +238,7 @@ func (s *server) serveRetrieve(w http.ResponseWriter, r *http.Request, live bool
 	defer cancel()
 	retr := *s.retr
 	retr.Exclude = s.injections.Seen(req.SessionID)
-	if len(exp.Added) > 0 {
-		retr.Expand = func(tokens []string) []string { return expand.Merge(tokens, exp.Added) }
-	}
-	res, err := retr.Retrieve(ctx, pk, req.Prompt, time.Now().Unix())
+	res, ctxTerms, err := retrieveFor(ctx, retr, req, exp.Added)
 	if err != nil {
 		s.log.Warn("retrieve failed", "err", err, "project", pk)
 		writeJSON(w, http.StatusOK, empty)
@@ -253,12 +251,52 @@ func (s *server) serveRetrieve(w http.ResponseWriter, r *http.Request, live bool
 	s.log.Info("retrieve", "project", pk, "count", res.Memories+res.Rules,
 		"memories", res.Memories, "rules", res.Rules, "omitted", res.Omitted,
 		"already_shown", len(retr.Exclude), "chars", len(res.Block), "live", live,
-		"expanded", len(exp.Added), "llm_ms", exp.MS, "ms", time.Since(start).Milliseconds())
+		"expanded", len(exp.Added), "ctx_terms", ctxTerms, "llm_ms", exp.MS, "ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"context": res.Block, "count": res.Memories + res.Rules,
 		"summary": res.Summary, "memories": res.Memories, "rules": res.Rules,
 		"saved": saved, "expanded": expandedLine(exp),
 	})
+}
+
+const (
+	weakPromptTokens = 3
+	contextTermCap   = 16
+)
+
+func retrieveFor(ctx context.Context, retr retrieve.Retriever, req retrieveReq, base []string) (retrieve.Result, int, error) {
+	pk := project.ResolveKey(req.CWD)
+	now := time.Now().Unix()
+	first, fallback := contextPlan(req)
+	retr.Expand = mergeTerms(base, first)
+	res, err := retr.Retrieve(ctx, pk, req.Prompt, now)
+	if err != nil || res.Memories > 0 || len(fallback) == 0 {
+		return res, len(first), err
+	}
+	retr.Expand = mergeTerms(base, fallback)
+	if second, err := retr.Retrieve(ctx, pk, req.Prompt, now); err == nil && second.Memories > 0 {
+		return second, len(fallback), nil
+	}
+	return res, len(first), nil
+}
+
+func contextPlan(req retrieveReq) (first, fallback []string) {
+	terms := textutil.Tokenize(req.Context, contextTermCap)
+	if len(terms) == 0 {
+		return nil, nil
+	}
+	if len(textutil.Tokenize(req.Prompt, retrieve.PromptTokenCap)) < weakPromptTokens {
+		return terms, nil
+	}
+	return nil, terms
+}
+
+func mergeTerms(base, terms []string) func([]string) []string {
+	added := append(append([]string(nil), base...), terms...)
+	if len(added) == 0 {
+		return nil
+	}
+	return func(tokens []string) []string { return expand.Merge(tokens, added) }
 }
 
 type sessionStartReq struct {
@@ -269,8 +307,9 @@ type sessionStartReq struct {
 
 // handleSessionStart serves the SessionStart hook: it forgets what the session
 // was shown when that context is gone (startup, /clear, compaction — not a
-// resume), then returns the standing context: this project's rules and the
-// user's preferences, within rules_max_chars. Always 200, failing open.
+// resume, and not a subagent, whose hook carries its parent's session id),
+// then returns the standing context: pinned rules, this project's rules and
+// the user's preferences, within rules_max_chars. Always 200, failing open.
 func (s *server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	empty := map[string]any{"context": "", "rules": 0, "preferences": 0, "omitted": 0}
 	var req sessionStartReq
@@ -278,7 +317,7 @@ func (s *server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, empty)
 		return
 	}
-	if req.Source != "resume" {
+	if req.Source != "resume" && req.Source != "subagent" {
 		s.injections.Reset(req.SessionID)
 	}
 	if !s.cfg.RulesOnSessionStart {
@@ -339,9 +378,22 @@ func (s *server) handleRules(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	if qv.Get("pinned") == "1" {
+		rules = pinnedOnly(rules)
+	}
 	sorted := retrieve.SortRules(rules, pk, limit, nil)
 	lines := retrieve.RuleLines(pk, sorted, s.cfg.MaxMemoryContentChars, time.Now().Unix())
 	writeJSON(w, http.StatusOK, map[string]any{"project": pk, "lines": lines, "count": len(lines)})
+}
+
+func pinnedOnly(cs []graph.Candidate) []graph.Candidate {
+	var out []graph.Candidate
+	for _, c := range cs {
+		if c.Pinned {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 type rememberReq struct {
@@ -477,7 +529,12 @@ type extractReq struct {
 	Source         string `json:"source"`
 	// BudgetMS is honoured by /v1/flush only: how long to hold the response
 	// before answering "running". 0 means wait as long as it takes.
-	BudgetMS int `json:"budget_ms"`
+	BudgetMS int  `json:"budget_ms"`
+	Agent    bool `json:"agent"`
+}
+
+func (r extractReq) job() Job {
+	return Job{SessionID: r.SessionID, TranscriptPath: r.TranscriptPath, CWD: r.CWD, Agent: r.Agent}
 }
 
 func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
@@ -494,7 +551,7 @@ func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
 	if source != "session_end" {
 		source = "stop"
 	}
-	s.queue.Notify(source, Job{SessionID: req.SessionID, TranscriptPath: req.TranscriptPath, CWD: req.CWD})
+	s.queue.Notify(source, req.job())
 	// Notify ran first, so the drain below already sees the new due time.
 	saved := s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
 	writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "saved": saved})
@@ -545,6 +602,10 @@ func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
 	}
 	if scored == nil {
 		scored = []retrieve.Scored{}
+	}
+	if sid := qv.Get("session_id"); sid != "" && len(scored) > 0 {
+		s.injections.Record(sid, toInjected(scored))
+		s.markInjected(scored)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"project": pk, "memories": scored})
 }
@@ -612,8 +673,7 @@ func (s *server) handleFlush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	budget := time.Duration(req.BudgetMS) * time.Millisecond
-	done, err := s.queue.FlushBudget(
-		Job{SessionID: req.SessionID, TranscriptPath: req.TranscriptPath, CWD: req.CWD}, budget)
+	done, err := s.queue.FlushBudget(req.job(), budget)
 	// Drained AFTER the flush so this run's own report is included. The
 	// error travels inside "saved" with a 200: the hook has to render a
 	// failed extraction, and a 5xx would read as the daemon being down.

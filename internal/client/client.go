@@ -15,6 +15,7 @@ type RetrieveRequest struct {
 	CWD       string `json:"cwd"`
 	Prompt    string `json:"prompt"`
 	SessionID string `json:"session_id"`
+	Context   string `json:"context,omitempty"`
 }
 
 type RetrieveResponse struct {
@@ -52,7 +53,8 @@ type ExtractRequest struct {
 	Source         string `json:"source"`
 	// BudgetMS applies to Flush only: how long the daemon may hold the
 	// response before answering "running".
-	BudgetMS int `json:"budget_ms,omitempty"`
+	BudgetMS int  `json:"budget_ms,omitempty"`
+	Agent    bool `json:"agent,omitempty"`
 }
 
 type ExtractResponse struct {

@@ -54,16 +54,24 @@ type fakeDaemon struct {
 	queries  map[string]url.Values
 	calls    map[string]int
 	lastBody map[string]any
+	bodies   map[string]map[string]any
 }
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
 	t.Helper()
-	fd := &fakeDaemon{queries: map[string]url.Values{}, calls: map[string]int{}}
+	fd := &fakeDaemon{queries: map[string]url.Values{}, calls: map[string]int{}, bodies: map[string]map[string]any{}}
 	mux := http.NewServeMux()
 	record := func(r *http.Request) {
 		fd.mu.Lock()
 		fd.queries[r.URL.Path] = r.URL.Query()
 		fd.calls[r.URL.Path]++
+		fd.mu.Unlock()
+	}
+	keepBody := func(r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fd.mu.Lock()
+		fd.bodies[r.URL.Path] = body
 		fd.mu.Unlock()
 	}
 	reply := func(w http.ResponseWriter, v any) {
@@ -130,14 +138,17 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 	})
 	mux.HandleFunc("POST /v1/retrieve", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
+		keepBody(r)
 		reply(w, map[string]any{"context": "", "memories": 0, "rules": 0})
 	})
 	mux.HandleFunc("POST /v1/flush", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
+		keepBody(r)
 		reply(w, map[string]any{"ok": true, "saved": map[string]any{}})
 	})
 	mux.HandleFunc("POST /v1/extract", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
+		keepBody(r)
 		w.WriteHeader(http.StatusAccepted)
 		reply(w, map[string]any{"queued": true})
 	})
@@ -157,6 +168,12 @@ func (fd *fakeDaemon) callCount(path string) int {
 	return fd.calls[path]
 }
 
+func (fd *fakeDaemon) body(path string) map[string]any {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	return fd.bodies[path]
+}
+
 func (fd *fakeDaemon) query(path string) url.Values {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
@@ -173,13 +190,26 @@ func runCLI(t *testing.T, addr string, args ...string) (string, int) {
 // runCLIStdin is runCLI with stdin, for the hook entrypoints.
 func runCLIStdin(t *testing.T, addr, stdin string, args ...string) (string, int) {
 	t.Helper()
+	return runCLIWith(t, cliCall{addr: addr, stdin: stdin}, args...)
+}
+
+type cliCall struct {
+	addr, stdin string
+	env         []string
+}
+
+var interactiveEnv = []string{"CLAUDE_CODE_SESSION_ATTENDED=1", "CLAUDE_CODE_ENTRYPOINT=cli", "IMEM_AGENT=", "CLAUDE_CODE_SESSION_ID="}
+
+func runCLIWith(t *testing.T, c cliCall, args ...string) (string, int) {
+	t.Helper()
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`{"http_addr": %q}`, addr)), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`{"http_addr": %q}`, c.addr)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(os.Args[0], args...)
 	cmd.Env = append(os.Environ(), "IMEM_CONTRACT_MAIN=1", "IMEM_CONFIG="+cfgPath)
-	cmd.Stdin = strings.NewReader(stdin)
+	cmd.Env = append(append(cmd.Env, interactiveEnv...), c.env...)
+	cmd.Stdin = strings.NewReader(c.stdin)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	err := cmd.Run()

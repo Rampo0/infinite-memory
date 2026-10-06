@@ -19,6 +19,12 @@ type Job struct {
 	SessionID      string `json:"session_id"`
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
+	Agent          bool   `json:"agent,omitempty"`
+}
+
+func (j Job) keepAgent(prev Job) Job {
+	j.Agent = j.Agent || prev.Agent
+	return j
 }
 
 // Queue debounces per-session extraction: rapid Stop events coalesce into
@@ -71,6 +77,7 @@ func (q *Queue) Stop()  { close(q.stop) }
 func (q *Queue) Notify(source string, j Job) {
 	q.mu.Lock()
 	p := q.ensureLocked(j.SessionID)
+	j = j.keepAgent(p.job)
 	p.job = j
 	if source == "session_end" {
 		if p.timer != nil {
@@ -111,6 +118,7 @@ func (q *Queue) Flush(j Job) error {
 		if j.TranscriptPath == "" {
 			j = p.job
 		}
+		j = j.keepAgent(p.job)
 	}
 	q.mu.Unlock()
 	if j.TranscriptPath == "" {
@@ -175,7 +183,7 @@ func (q *Queue) enqueue(j Job) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	p := q.ensureLocked(j.SessionID)
-	p.job = j
+	p.job = j.keepAgent(p.job)
 	q.enqueueLocked(p)
 }
 
@@ -344,9 +352,11 @@ func (w *Worker) process(j Job) (SaveReport, error) {
 
 	// Fails closed: anything not from ~/.claude/projects is an agent's
 	// transcript, even a path that no longer resolves into an agent root since
-	// it was validated. It is extracted isolated, its rules are demoted, and
-	// it never reconciles against or grades the user's memories.
-	foreign := !fromClaudeProjects(j.TranscriptPath)
+	// it was validated, and so is any session a hook flagged as headless
+	// (claude -p, SDK agents) — the flag only ever demotes. It is extracted
+	// isolated, its rules are demoted, and it never reconciles against or
+	// grades the user's memories.
+	foreign := isForeign(j)
 
 	var pc extract.PromptContext
 	if !foreign {
@@ -410,6 +420,10 @@ func (w *Worker) process(j Job) (SaveReport, error) {
 	}
 	w.Log.Info("extracted", "session", j.SessionID, "memories", len(mems), "cursor", total)
 	return rep, nil
+}
+
+func isForeign(j Job) bool {
+	return j.Agent || !fromClaudeProjects(j.TranscriptPath)
 }
 
 // fail keeps the cursor untouched so the next Stop retries the delta; after

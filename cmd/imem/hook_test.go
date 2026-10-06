@@ -83,3 +83,77 @@ func TestHookSessionStartInjectsRules(t *testing.T) {
 		t.Fatalf("the daemon must learn the session and the source, got %v", body)
 	}
 }
+
+func hookContext(t *testing.T, out string) (event, context string) {
+	t.Helper()
+	var got struct {
+		Hook struct {
+			Event   string `json:"hookEventName"`
+			Context string `json:"additionalContext"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("hook output is not JSON: %v\n%s", err, out)
+	}
+	return got.Hook.Event, got.Hook.Context
+}
+
+func TestHookUserPromptAlwaysCarriesTheProtocol(t *testing.T) {
+	fd := newFakeDaemon(t)
+	for addr, label := range map[string]string{addrOf(fd): "no matches", "127.0.0.1:1": "daemon down"} {
+		out, _ := runCLIStdin(t, addr, hookInput(t.TempDir(), "lanjut"), "hook", "user-prompt")
+		if event, ctx := hookContext(t, out); event != "UserPromptSubmit" || !strings.Contains(ctx, "<imem-protocol>") {
+			t.Fatalf("%s: the self-search protocol must reach the model, got %q %q", label, event, ctx)
+		}
+	}
+}
+
+func TestHookUserPromptSendsTheLastExchange(t *testing.T) {
+	fd := newFakeDaemon(t)
+	path := filepath.Join(t.TempDir(), "t.jsonl")
+	lines := `{"type":"user","message":{"role":"user","content":"verify the imem retrieval spec"}}` + "\n" +
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hooks inject memories"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := json.Marshal(map[string]any{"session_id": "s1", "cwd": t.TempDir(), "prompt": "lanjut", "transcript_path": path})
+	runCLIStdin(t, addrOf(fd), string(in), "hook", "user-prompt")
+	if ctx, _ := fd.body("/v1/retrieve")["context"].(string); ctx != "verify the imem retrieval spec\nhooks inject memories" {
+		t.Fatalf("the retrieve must carry the last exchange, got %q", ctx)
+	}
+}
+
+func TestHookStopHeadlessNeverBlocks(t *testing.T) {
+	for _, env := range [][]string{{"CLAUDE_CODE_SESSION_ATTENDED=0"}, {"CLAUDE_CODE_ENTRYPOINT=sdk-cli"}, {"IMEM_AGENT=ai-review"}} {
+		fd := newFakeDaemon(t)
+		runCLIWith(t, cliCall{addr: addrOf(fd), stdin: hookInput(t.TempDir(), ""), env: env}, "hook", "stop")
+		if fd.callCount("/v1/flush") != 0 || fd.callCount("/v1/extract") != 1 || fd.body("/v1/extract")["agent"] != true {
+			t.Fatalf("%v: a headless stop must queue an agent extract without flushing, flush=%d extract=%d body=%v",
+				env, fd.callCount("/v1/flush"), fd.callCount("/v1/extract"), fd.body("/v1/extract"))
+		}
+	}
+}
+
+func TestHookStopInteractiveFlushesAsTheUser(t *testing.T) {
+	fd := newFakeDaemon(t)
+	runCLIStdin(t, addrOf(fd), hookInput(t.TempDir(), ""), "hook", "stop")
+	if fd.callCount("/v1/flush") != 1 || fd.body("/v1/flush")["agent"] != nil {
+		t.Fatalf("an interactive stop flushes as the user, got flush=%d body=%v", fd.callCount("/v1/flush"), fd.body("/v1/flush"))
+	}
+}
+
+func TestHookSubagentStartInjectsRulesAndProtocol(t *testing.T) {
+	fd := newFakeDaemon(t)
+	in, _ := json.Marshal(map[string]any{"session_id": "parent", "cwd": t.TempDir(), "agent_type": "Explore", "hook_event_name": "SubagentStart"})
+	out, _ := runCLIStdin(t, addrOf(fd), string(in), "hook", "subagent-start")
+	event, ctx := hookContext(t, out)
+	if event != "SubagentStart" || !strings.Contains(ctx, "- [rule] Never use --bare") || !strings.Contains(ctx, "<imem-protocol>") {
+		t.Fatalf("a subagent needs the standing rules and the protocol, got %q %q", event, ctx)
+	}
+	fd.mu.Lock()
+	body := fd.lastBody
+	fd.mu.Unlock()
+	if body["source"] != "subagent" || body["session_id"] != "parent" {
+		t.Fatalf("the daemon must learn it is a subagent of the parent session, got %v", body)
+	}
+}

@@ -176,3 +176,27 @@ func TestQueueNilOnPendingSafe(t *testing.T) {
 	defer q.Stop()
 	q.Notify("stop", Job{SessionID: "s1", TranscriptPath: "/t"})
 }
+
+func TestQueueAgentFlagOnlyEverDemotes(t *testing.T) {
+	rec := &recorder{done: make(chan struct{}, 8)}
+	q := newTestQueue(10*time.Second, rec)
+	defer q.Stop()
+
+	q.Notify("stop", Job{SessionID: "s4", TranscriptPath: "/t", CWD: "/c", Agent: true})
+	q.Notify("session_end", Job{SessionID: "s4", TranscriptPath: "/t", CWD: "/c"})
+	select {
+	case <-rec.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session_end should enqueue immediately")
+	}
+	if err := q.Flush(Job{SessionID: "s4", TranscriptPath: "/t"}); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, j := range rec.calls {
+		if !j.Agent {
+			t.Fatalf("a session once flagged headless must stay an agent job, got %+v", rec.calls)
+		}
+	}
+}

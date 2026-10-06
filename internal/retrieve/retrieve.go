@@ -62,8 +62,8 @@ type Retriever struct {
 	Exclude map[string]bool
 }
 
-// promptTokenCap bounds the tokens taken from a prompt.
-const promptTokenCap = 32
+// PromptTokenCap bounds the tokens taken from a prompt.
+const PromptTokenCap = 32
 
 // Result is one retrieval: the block injected into the model's context, plus
 // the compact summary and counts shown to the user in the CLI.
@@ -179,7 +179,7 @@ func withoutIDs(scored []Scored, exclude map[string]bool) []Scored {
 // Expansion runs AFTER tokenizing, not before: a prompt made entirely of
 // stopwords tokenizes to nothing, and rescuing exactly that case is the point.
 func (r *Retriever) expandTokens(prompt string) []string {
-	tokens := textutil.Tokenize(prompt, promptTokenCap)
+	tokens := textutil.Tokenize(prompt, PromptTokenCap)
 	if r.Expand == nil {
 		return tokens
 	}
@@ -359,9 +359,9 @@ func MergeAndScore(q1, q2, q3 []graph.Candidate, now int64, pk string, o ScoreOp
 	return out
 }
 
-// SortRules orders standing rules current-project-first, then by how often
-// they were re-observed and how recently, caps at k (k <= 0 means no cap) and
-// drops ids already shown in the scored section.
+// SortRules orders standing rules pinned-first, then current-project-first,
+// then by how often they were re-observed and how recently, caps at k (k <= 0
+// means no cap) and drops ids already shown in the scored section.
 func SortRules(rules []graph.Candidate, pk string, k int, exclude map[string]bool) []graph.Candidate {
 	var out []graph.Candidate
 	for _, r := range rules {
@@ -370,6 +370,9 @@ func SortRules(rules []graph.Candidate, pk string, k int, exclude map[string]boo
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].Pinned != out[j].Pinned {
+			return out[i].Pinned
+		}
 		li, lj := out[i].ProjectKey == pk, out[j].ProjectKey == pk
 		if li != lj {
 			return li
@@ -389,28 +392,32 @@ func SortRules(rules []graph.Candidate, pk string, k int, exclude map[string]boo
 }
 
 // SessionRules is the standing context injected once per session, in fill
-// order: this project's rules (a parent workspace counts as this project:
-// ~/ws rules apply in ~/ws/repo), its preferences, then every other project's
-// rules and preferences. Within a group: most re-observed, then most recent.
-// The caller's char budget decides how far down the list makes it in.
+// order: pinned rules and preferences (the core set, e.g. the code
+// constitution, which must survive the budget in every repo), this project's
+// rules (a parent workspace counts as this project: ~/ws rules apply in
+// ~/ws/repo), its preferences, then every other project's rules and
+// preferences. Within a group: most re-observed, then most recent. The
+// caller's char budget decides how far down the list makes it in.
 func SessionRules(rules, prefs []graph.Candidate, pk string) []graph.Candidate {
 	local := func(c graph.Candidate) bool {
 		return c.ProjectKey != "" && (c.ProjectKey == pk || strings.HasPrefix(pk, c.ProjectKey+"/"))
 	}
-	var groups [4][]graph.Candidate
-	for _, r := range rules {
-		if local(r) {
-			groups[0] = append(groups[0], r)
-		} else {
-			groups[2] = append(groups[2], r)
+	var groups [5][]graph.Candidate
+	place := func(c graph.Candidate, localGroup, otherGroup int) {
+		switch {
+		case c.Pinned:
+			groups[0] = append(groups[0], c)
+		case local(c):
+			groups[localGroup] = append(groups[localGroup], c)
+		default:
+			groups[otherGroup] = append(groups[otherGroup], c)
 		}
 	}
+	for _, r := range rules {
+		place(r, 1, 3)
+	}
 	for _, p := range prefs {
-		if local(p) {
-			groups[1] = append(groups[1], p)
-		} else {
-			groups[3] = append(groups[3], p)
-		}
+		place(p, 2, 4)
 	}
 	var out []graph.Candidate
 	for _, g := range groups {

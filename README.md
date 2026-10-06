@@ -1,16 +1,20 @@
 # infinite-memory
 
-Persistent memory for Claude Code, backed by Memgraph. Every session starts with its
-project's standing rules; every prompt gets the past memories that match it; every turn
-gets new memories extracted — reconciled against what is already known — and the
-session model can search or save memory itself through MCP tools. No embeddings, no
-API key: extraction runs headless `claude -p` on your subscription login; retrieval is
+Persistent memory for Claude Code, backed by Memgraph. Every session and every subagent
+starts with the standing rules (pinned core rules first); every prompt gets the past
+memories that match it — a vague follow-up ("lanjut", "fix that") is matched with the
+last exchange — plus a protocol line telling the model to call `imem_search` with its own
+keywords before answering; turns get new memories extracted, reconciled against what is
+already known. Headless `claude -p` sessions and the bots in `~/scratch` get the same
+loop at agent trust (rules demoted to facts, never grading your memories). No embeddings,
+no API key: extraction runs headless `claude -p` on your subscription login; retrieval is
 idf-weighted keyword + entity matching over the graph, and runs in milliseconds.
 
 ```
 SessionStart ───── imem hook session-start ─ POST /v1/session-start ┐  standing rules, once
-UserPromptSubmit ── imem hook user-prompt ── POST /v1/retrieve ─────┤  ≤6K chars, ~50ms
-Stop ───────────── imem hook stop ───────── POST /v1/flush ─────────┤  blocking, budget-capped
+SubagentStart ──── imem hook subagent-start POST /v1/session-start ┤  same rules, per subagent
+UserPromptSubmit ── imem hook user-prompt ── POST /v1/retrieve ─────┤  ≤6K chars, ~50ms, + protocol
+Stop ───────────── imem hook stop ───────── POST /v1/flush ─────────┤  blocking (headless: /v1/extract)
 SessionEnd ─────── imem hook session-end ── POST /v1/extract ───────┤  fire-and-forget
 imem mcp (stdio) ─ imem_search / imem_remember ── /v1/memories, /v1/remember
                                                                      ▼
@@ -257,7 +261,15 @@ every escaped statement.
 
 `imem mcp` is a stdio MCP server (stdlib JSON-RPC; registered at user scope). The session
 model writes its own queries with the whole conversation as context — the job the old
-per-prompt LLM expander did in tens of seconds, now free and only when needed.
+per-prompt LLM expander did in tens of seconds, now free. Every prompt's injection ends with
+an `<imem-protocol>` line (also when nothing matched or the daemon is down) asking the model
+to call `imem_search` at least once per turn with keywords it derives itself; the MCP
+instructions and tool description say the same. Searches carry `CLAUDE_CODE_SESSION_ID`, so
+their results join the session's injection log: later prompts don't repeat them, and the
+extractor grades them used / wrong like injected ones.
+
+`imem mcp --agent --cwd <project>` is the bots' read-only variant: `imem_search` only, results
+prefixed as untrusted reference data, scoped to `--cwd`, never recorded against a session.
 
 | tool | does |
 |---|---|
@@ -356,10 +368,27 @@ the agents before changing any of them:
 | `agentkit.imem.entities` / `entity_matches` | `imem entities --limit 500` | lines match `\s*(\d+)x\s+(.+?)\s{2,}\[` |
 | on-call prep, ai-review `run_imem` | `imem entity "<name>"`, `imem search "<q>" --cwd ~/accountworkspace` | flags and line format unchanged, search capped at 10, no relevance floor |
 | ai-review `prep.newest_rules` | `imem rules --cwd ~/accountworkspace` | bare `- [rule] …` lines, non-zero exit when the daemon is down |
-| `agentkit.imem.save` | `POST /v1/extract` (`session_end`, transcript under an `agent_roots` dir) | 202; extracted isolated, add-only, rules demoted |
+| `agentkit.imem.save` / `retry_pending` | `POST /v1/extract` (`session_end`, transcript under an `agent_roots` dir) | 202; extracted isolated, add-only, rules demoted |
+| `agentkit.imem.recall` | `POST /v1/retrieve/preview`, `GET /v1/rules?pinned=1` | `context` block as the hook would inject it; pinned rule lines |
+| bots' per-run MCP config | `imem mcp --agent --cwd ~/accountworkspace` | tools/list has `imem_search` only; results start with `Untrusted reference data from imem` |
 
 The agents run `claude -p --restricted --strict-mcp-config` with explicit MCP lists, so
-imem's hooks never fire in them and the `imem` MCP server is never visible to them.
+imem's hooks never fire in them; they get recall from deterministic code and the read-only
+`--agent` server in their stage's MCP list.
+
+Any other headless `claude -p` (a plugin's judge, a script, a future tool) keeps the user's
+hooks, so it gets rules, recall, the protocol and extraction automatically. The hook marks it
+headless (`CLAUDE_CODE_SESSION_ATTENDED=0`, an `sdk-*` `CLAUDE_CODE_ENTRYPOINT`, or
+`IMEM_AGENT=<name>`): its Stop never blocks on a flush, and its extraction runs at agent trust
+(isolated, add-only, rules and preferences demoted) even though its transcript sits under
+`~/.claude/projects`. `ignore_cwds` still drops spawns that are not conversations at all.
+
+### Pinned rules
+
+`imem pin <id or title words>` marks a rule or preference as core: it leads the SessionStart
+and SubagentStart block in every repo, survives the `rules_k` cap and the char budget ahead
+of local rules, and is listed first by `imem rules` (`--pinned` lists only those). Keep the
+pinned set small — the whole block must stay under Claude Code's 10,000-char inline cap.
 
 ## Coexistence with other memory systems
 

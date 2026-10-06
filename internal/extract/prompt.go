@@ -58,6 +58,10 @@ Do NOT extract: transient task state, small talk, generic programming knowledge,
 anything already implied by an existing entity name alone, or restatements of the
 user's current request.
 
+Never record personal data of customers or end users: names, chat handles, phone
+numbers, emails, ID numbers (NIK, passport), registration or account codes. Keep the
+knowledge and describe the person generically ("a customer", "a WNA beneficial owner").
+
 Rules for output:
 - 0 to 5 memories. An empty list is a good answer for chit-chat or pure execution turns.
 - title: max 10 words, specific. content: 1-3 sentences, self-contained (readable

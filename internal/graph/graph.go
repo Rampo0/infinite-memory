@@ -134,6 +134,12 @@ func recStrs(rec *neo4j.Record, key string) []string {
 	return out
 }
 
+func recBool(rec *neo4j.Record, key string) bool {
+	v, _ := rec.Get(key)
+	b, _ := v.(bool)
+	return b
+}
+
 func recInt(rec *neo4j.Record, key string) int64 {
 	v, _ := rec.Get(key)
 	switch n := v.(type) {
