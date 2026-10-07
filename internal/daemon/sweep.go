@@ -84,7 +84,7 @@ func (s *server) startSweepLoop() {
 	sw := &sweeper{
 		store:   s.store,
 		notify:  s.queue.Notify,
-		valid:   func(p string) bool { return validTranscriptPath(p, s.cfg.AgentRoots) },
+		valid:   func(p string) bool { return validTranscriptPath(p, s.agentRoots()) },
 		ignored: s.cfg.Ignored,
 		now:     time.Now,
 		idle:    sweepIdle,

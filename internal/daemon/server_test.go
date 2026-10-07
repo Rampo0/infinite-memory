@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -461,5 +462,25 @@ func TestSessionStartBlockKeepsPinnedItemsWithARulesFile(t *testing.T) {
 	block, _ := sessionStart(s, "s1", "startup")["context"].(string)
 	if !strings.Contains(block, "- [rule] Foreign rule") || strings.Contains(block, "Local rule") {
 		t.Fatalf("pinned items lead every session, the rest live in the file:\n%s", block)
+	}
+}
+
+func TestExtractAcceptsAnAgentRegisteredAfterStart(t *testing.T) {
+	agentsDir := t.TempDir()
+	root := t.TempDir()
+	path := agentkitTranscript(t, root, "late.jsonl")
+	rec := &jobRecorder{}
+	s := extractServer(t, nil, rec)
+	s.roots = newRootSet(nil, agentsDir)
+	if w := postExtract(s, map[string]any{"session_id": "l1", "transcript_path": path, "cwd": "/c", "source": "session_end"}); w.Code != http.StatusBadRequest {
+		t.Fatalf("an unregistered root must be refused, got %d", w.Code)
+	}
+	drop := fmt.Sprintf(`{"name": "late-bot", "root": %q}`, root)
+	if err := os.WriteFile(filepath.Join(agentsDir, "late-bot.json"), []byte(drop), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.roots.checked = time.Time{}
+	if w := postExtract(s, map[string]any{"session_id": "l1", "transcript_path": path, "cwd": "/c", "source": "session_end"}); w.Code != http.StatusAccepted {
+		t.Fatalf("a drop-in written after start must be honoured without a restart, got %d", w.Code)
 	}
 }

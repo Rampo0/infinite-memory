@@ -41,6 +41,7 @@ type server struct {
 	// injections tracks what each session was already shown.
 	injections *injectionLog
 	gates      *gateLog
+	roots      *rootSet
 	// byKind fetches every live memory of one kind (func field so handlers
 	// test without Memgraph, the same injection shape as Expander.Run).
 	byKind func(ctx context.Context, kind string) ([]graph.Candidate, error)
@@ -112,6 +113,7 @@ func newServer(cfg config.Config, store *graph.Store, log *slog.Logger) *server 
 		corpus:     corpus,
 		injections: loadInjectionLog(cfg),
 		gates:      newGateLog(),
+		roots:      newRootSet(cfg.AgentRoots, config.AgentsDir()),
 		byKind: func(ctx context.Context, kind string) ([]graph.Candidate, error) {
 			return store.ByKind(ctx, kind, -1)
 		},
@@ -633,7 +635,7 @@ func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if !validTranscriptPath(req.TranscriptPath, s.cfg.AgentRoots) {
+	if !validTranscriptPath(req.TranscriptPath, s.agentRoots()) {
 		http.Error(w, "invalid transcript_path", http.StatusBadRequest)
 		return
 	}
@@ -648,6 +650,13 @@ func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
 	// Notify ran first, so the drain below already sees the new due time.
 	saved := s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
 	writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "saved": saved})
+}
+
+func (s *server) agentRoots() []string {
+	if s.roots == nil {
+		return s.cfg.AgentRoots
+	}
+	return s.roots.All()
 }
 
 func (s *server) rememberSource(j Job) {
@@ -783,7 +792,7 @@ func (s *server) handleFlush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if req.TranscriptPath != "" && !validTranscriptPath(req.TranscriptPath, s.cfg.AgentRoots) {
+	if req.TranscriptPath != "" && !validTranscriptPath(req.TranscriptPath, s.agentRoots()) {
 		http.Error(w, "invalid transcript_path", http.StatusBadRequest)
 		return
 	}

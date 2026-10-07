@@ -255,3 +255,37 @@ func TestRetrieveKDefaultsToNoCap(t *testing.T) {
 		t.Fatalf("every match competes for the budget by default, got retrieve_k %d", got)
 	}
 }
+
+func TestDropInRootsReadEveryAgentFile(t *testing.T) {
+	dir := t.TempDir()
+	home, _ := os.UserHomeDir()
+	files := map[string]string{
+		"ai-review.json": `{"name": "ai-review", "root": "~/.ai-review/imem"}`,
+		"on-call.json":   `{"name": "on-call", "root": "/abs/on-call/imem"}`,
+		"broken.json":    `{"name": `,
+		"empty.json":     `{"name": "empty", "root": "  "}`,
+		"notes.txt":      `{"root": "/ignored"}`,
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := DropInRoots(dir)
+	want := []string{filepath.Join(home, ".ai-review/imem"), "/abs/on-call/imem"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
+func TestAgentsDirSitsNextToTheConfig(t *testing.T) {
+	t.Setenv("IMEM_CONFIG", "/x/y/config.json")
+	if got := AgentsDir(); got != "/x/y/agents.d" {
+		t.Fatalf("got %q", got)
+	}
+	t.Setenv("IMEM_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", "/xdg")
+	if got := AgentsDir(); got != "/xdg/infinite-memory/agents.d" {
+		t.Fatalf("got %q", got)
+	}
+}

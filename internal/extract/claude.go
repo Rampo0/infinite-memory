@@ -97,7 +97,11 @@ func NewRunner(cfg config.Config) *Runner {
 var binFallbacks = []string{
 	"~/.local/bin/claude",    // current installer
 	"~/.claude/local/claude", // legacy installer
+	"/opt/homebrew/bin/claude",
+	"/usr/local/bin/claude",
 }
+
+func (r *Runner) ResolveBin() (string, error) { return r.resolveBin() }
 
 func (r *Runner) resolveBin() (string, error) {
 	if p, err := exec.LookPath(r.Bin); err == nil {

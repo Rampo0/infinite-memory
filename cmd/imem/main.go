@@ -30,6 +30,7 @@ import (
 	"github.com/Rampo0/infinite-memory/internal/hookio"
 	"github.com/Rampo0/infinite-memory/internal/mcp"
 	"github.com/Rampo0/infinite-memory/internal/project"
+	"github.com/Rampo0/infinite-memory/internal/setup"
 )
 
 func main() {
@@ -67,6 +68,12 @@ func main() {
 		cmdMCP(os.Args[2:])
 	case "migrate-repo-keys":
 		cmdMigrateRepoKeys(os.Args[2:])
+	case "agents":
+		cmdAgents(os.Args[2:])
+	case "setup":
+		cmdSetup(os.Args[2:])
+	case "doctor":
+		cmdDoctor(os.Args[2:])
 	case "consolidate":
 		cmdConsolidate(os.Args[2:])
 	case "reindex":
@@ -109,7 +116,7 @@ func usage() {
   imem consolidate --archive [--apply]  memories injected 20+ times, never used, unseen 60d+ (archive = out of retrieval)
   imem quota [--resets]                subscription usage (5-hour / 7-day windows) via one tiny probe
   imem reindex [--yes]                 recompute keywords and alias-only tokens with today's tokenizer (no LLM)
-  imem migrate-repo-keys [--map old=new]... [--yes]   give worktree-keyed memories their repo (additive, dry-run without --yes)
+  imem migrate-repo-keys [--map old=new]... [--map-prefix old=new]... [--yes]   give moved or worktree-keyed memories their repo (additive, dry-run without --yes)
   imem mcp [--agent] [--cwd path]      MCP server on stdio (imem_search, imem_remember); --agent: search only, results marked untrusted, project from --cwd
   imem backfill-aliases [--limit N] [--batch N] [--workers N] [--max-usage F] [--yes]   index-time aliases for older memories (dry-run without --yes)
   imem entity <name...>                one entity: relations + memories mentioning it
@@ -118,6 +125,9 @@ func usage() {
   imem restore <file> --yes            WIPE the graph and replay a backup
   imem status                          daemon + graph health and per-project counts
   imem hooks-json                      print the ~/.claude/settings.json hooks snippet
+  imem setup [--restore <dump>] [--dry-run]   install on this machine: config, hooks, MCP, rules import, launchd
+  imem doctor [--json]                 check every piece of the install, with the fix for each failure
+  imem agents [list | add <name> <dir> | remove <name>]   bot transcript roots (drop-ins, no restart)
 `)
 }
 
@@ -852,23 +862,27 @@ Nothing has been changed. Re-run with --yes to proceed.
 `, cfg.MemgraphURI, len(stmts), path)
 		os.Exit(2)
 	}
+	if err := replayDump(cfg, stmts); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("restored %d statements from %s\n", len(stmts), path)
+}
 
+func replayDump(cfg config.Config, stmts []string) error {
 	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "driver:", err)
-		os.Exit(1)
+		return fmt.Errorf("driver: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	if err := store.Ping(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "memgraph unreachable at %s: %v\n", cfg.MemgraphURI, err)
-		os.Exit(1)
+		return fmt.Errorf("memgraph unreachable at %s: %w", cfg.MemgraphURI, err)
 	}
 	if err := store.Restore(ctx, stmts); err != nil {
-		fmt.Fprintln(os.Stderr, "restore:", err)
-		os.Exit(1)
+		return fmt.Errorf("restore: %w", err)
 	}
-	fmt.Printf("restored %d statements from %s\n", len(stmts), path)
+	return nil
 }
 
 func humanBytes(n int64) string {
@@ -954,30 +968,11 @@ func cmdHooksJSON() {
 	} else {
 		exe = "imem"
 	}
-	snippet := map[string]any{
-		"hooks": map[string]any{
-			"UserPromptSubmit": []any{map[string]any{
-				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook user-prompt", "timeout": promptHookTimeout}},
-			}},
-			// Standing rules once per session; also fires after /clear and
-			// compaction, when the earlier copy has left the context.
-			"SessionStart": []any{map[string]any{
-				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook session-start", "timeout": 10}},
-			}},
-			"SubagentStart": []any{map[string]any{
-				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook subagent-start", "timeout": 10}},
-			}},
-			// Stop must be synchronous: an async hook's stdout is discarded,
-			// which would silently drop the "saved" line. timeout covers the
-			// blocking flush (stop_flush_budget_ms, default 90s) plus slack.
-			"Stop": []any{map[string]any{
-				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook stop", "async": false, "timeout": 120}},
-			}},
-			"SessionEnd": []any{map[string]any{
-				"hooks": []any{map[string]any{"type": "command", "command": exe + " hook session-end", "async": true}},
-			}},
-		},
+	hooks := map[string]any{}
+	for _, ev := range []string{"UserPromptSubmit", "SessionStart", "SubagentStart", "Stop", "SessionEnd"} {
+		hooks[ev] = []any{setup.HookGroup(ev, exe, promptHookTimeout)}
 	}
+	snippet := map[string]any{"hooks": hooks}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(snippet)
@@ -1359,23 +1354,31 @@ func postJSONBody(u string, body, out any) error {
 // same-project boost and standing rules treat them as the repo's. Additive and
 // re-runnable: project_key and hashes never change; undo is REMOVE m.repo_key.
 // Without --yes it only prints the plan.
-func cmdMigrateRepoKeys(args []string) {
-	cfg := config.Load()
-	manual := map[string]string{}
-	yes := false
+func parseMigrateArgs(args []string) (manual, prefixes map[string]string, yes bool) {
+	manual, prefixes = map[string]string{}, map[string]string{}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--yes":
 			yes = true
-		case "--map":
+		case "--map", "--map-prefix":
 			if i+1 < len(args) {
 				if old, nw, ok := strings.Cut(args[i+1], "="); ok {
-					manual[old] = nw
+					target := manual
+					if args[i] == "--map-prefix" {
+						target = prefixes
+					}
+					target[strings.TrimRight(old, "/")] = strings.TrimRight(nw, "/")
 				}
 				i++
 			}
 		}
 	}
+	return manual, prefixes, yes
+}
+
+func cmdMigrateRepoKeys(args []string) {
+	cfg := config.Load()
+	manual, prefixes, yes := parseMigrateArgs(args)
 	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "driver:", err)
@@ -1387,6 +1390,7 @@ func cmdMigrateRepoKeys(args []string) {
 		fmt.Fprintln(os.Stderr, "memgraph:", err)
 		os.Exit(1)
 	}
+	project.ExpandPrefixMaps(keys, prefixes, manual)
 	resolve := func(k string) (string, bool) {
 		if _, err := os.Stat(k); err != nil {
 			return "", false

@@ -2,17 +2,25 @@ BIN_DIR := bin
 BIN := $(BIN_DIR)/imem
 INSTALL_BIN := $(HOME)/.local/bin/imem
 
-.PHONY: build install run up down init test itest itest-down search status hooks-json cypher backup backups restore
+.PHONY: build install setup doctor run up down init test itest itest-down search status hooks-json cypher backup backups restore
 
 build:
 	go build -o $(BIN) ./cmd/imem
 
-# Build beside the target and rename: the agents (~/scratch) exec this binary
+# Build beside the target and rename: the agents (self-agent) exec this binary
 # every run, and must never catch a half-written file.
 install:
 	mkdir -p $(HOME)/.local/bin
 	go build -o $(INSTALL_BIN).tmp ./cmd/imem
 	mv -f $(INSTALL_BIN).tmp $(INSTALL_BIN)
+
+# One command on a new machine: Memgraph up, binary installed, then config, hooks,
+# MCP server, rules import and the launchd job. RESTORE=<dump> replays a backup first.
+setup: up install
+	$(INSTALL_BIN) setup $(if $(RESTORE),--restore $(RESTORE),)
+
+doctor:
+	$(INSTALL_BIN) doctor
 
 run: build
 	$(BIN) daemon
@@ -45,8 +53,8 @@ search: build
 status: build
 	$(BIN) status
 
-hooks-json: build
-	$(BIN) hooks-json
+hooks-json: install
+	$(INSTALL_BIN) hooks-json
 
 cypher:
 	docker compose exec memgraph mgconsole

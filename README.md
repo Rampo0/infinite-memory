@@ -6,8 +6,9 @@ skill invocations included — gets the past memories that match it, as many as 
 inlines, and a vague follow-up ("lanjut", "fix that") is matched with the last exchange.
 A protocol line tells the model to call `imem_search` with its own keywords before
 answering, and a turn that never searched is sent back once to do it. Every turn gets new
-memories extracted, reconciled against what is already known, and nothing is skipped. Headless `claude -p` sessions and the bots in `~/scratch` get the same
-loop at agent trust (rules demoted to facts, never grading your memories). No embeddings,
+memories extracted, reconciled against what is already known, and nothing is skipped.
+Headless `claude -p` sessions and the self-agent bots get the same loop at agent trust
+(rules demoted to facts, never grading your memories). No embeddings,
 no API key: extraction runs headless `claude -p` on your subscription login; retrieval is
 idf-weighted keyword + entity matching over the graph, and runs in milliseconds.
 
@@ -33,34 +34,58 @@ imem mcp (stdio) ─ imem_search / imem_remember ── /v1/memories, /v1/rememb
 
 ## Setup
 
+Prerequisites: Docker (compose v2), Go 1.24+, Claude Code logged in (`claude auth login`).
+
 ```sh
-make up        # memgraph + memgraph-lab (http://localhost:3000)
-make install   # builds ~/.local/bin/imem (atomically: build to .tmp, then rename)
-make init      # schema: indexes + constraints
-make run       # daemon in foreground (or install via launchd — section below)
-make hooks-json  # prints the snippet to merge into ~/.claude/settings.json
-claude mcp add --scope user imem -- ~/.local/bin/imem mcp   # imem_search / imem_remember
+make setup                       # Memgraph up, ~/.local/bin/imem installed, then `imem setup`
+make setup RESTORE=<dump.gz>     # same, replaying a backup from another machine first
+make doctor                      # every piece of the install, with the fix for each failure
 ```
 
-Hooks are registered as additional array entries in `~/.claude/settings.json`
-(`SessionStart` → standing rules, `UserPromptSubmit` → retrieve, `Stop`/`SessionEnd` →
-extract). New Claude Code sessions pick them up automatically. Allowlisting
-`mcp__imem__imem_search` is safe (it only records which memories a session was shown); leave `imem_remember` behind its
-permission prompt — a model that read a malicious file could otherwise plant a rule.
+`imem setup` is idempotent and backs up every file it changes (`*.bak-imem-<time>`). It writes
+`rules_file` into `~/.config/infinite-memory/config.json` (creating it when missing, keeping
+every other key), merges the five hooks and the `mcp__imem__imem_search` allow rule into
+`~/.claude/settings.json` (other hooks and the key order stay as they are; a stale imem hook is
+replaced where it sits), adds `@imem-rules.md` to `~/.claude/CLAUDE.md`, registers the `imem`
+MCP server at user scope with `alwaysLoad`, renders the launchd job for this machine's home and
+binary, then restarts the daemon onto the installed binary. `--dry-run` prints what it would do.
+With `--restore` it stops the daemon, replays the dump, and — when the dump came from a different
+home directory — maps that home's project keys onto this one (additive `repo_key`).
+
+Allowlisting `mcp__imem__imem_search` is safe (it only records which memories a session was
+shown); leave `imem_remember` behind its permission prompt — a model that read a malicious file
+could otherwise plant a rule.
+
+### A new Mac
+
+1. On the old Mac: `imem backup`, then copy the newest
+   `~/.local/state/infinite-memory/backups/imem-*.cypherl.gz`, plus
+   `~/.config/infinite-memory/config.json` and `eval.jsonl` if you tuned them, through a channel
+   you trust (the dump holds work context).
+2. On the new Mac: install Docker, Go and Claude Code, `claude auth login`, clone this repo
+   anywhere, put the copied config in `~/.config/infinite-memory/`, then
+   `make setup RESTORE=<path to the dump>` and `make doctor`.
+3. Clone self-agent and run its `bin/install`: it registers each bot's transcript root in
+   `~/.config/infinite-memory/agents.d/` itself, before or after this repo is installed.
+
+Bots register their transcript roots as drop-ins (`imem agents add <name> <dir>` or a JSON file in
+`agents.d/`); the daemon re-reads them within 2 seconds, no restart. `agent_roots` in config.json
+still works. Repos that moved keep their memories with
+`imem migrate-repo-keys --map <old path>=<new path>` (`--map-prefix` for a whole tree).
 
 ## launchd (macOS): run the daemon at login
 
-Install — the plist keeps the daemon alive and starts it at login:
+`imem setup` installs it (rendered for this machine's home and binary; `launchd/com.ammar.imemd.plist`
+is only an example). By hand:
 
 ```sh
 pkill -f 'imem daemon' || true     # kill any manually started daemon first (port 7690 clash)
-mkdir -p ~/Library/LaunchAgents
-cp launchd/com.ammar.imemd.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ammar.imemd.plist
+imem setup                         # writes ~/Library/LaunchAgents/com.ammar.imemd.plist and bootstraps it
 ```
 
 Restart — needed after every `make install` (launchd keeps running the old binary)
-or after changing `~/.config/infinite-memory/config.json`:
+or after changing `~/.config/infinite-memory/config.json`. Right after the binary is replaced,
+macOS may kill the first start (`OS_REASON_CODESIGNING`); launchd retries within ~10s:
 
 ```sh
 launchctl kickstart -k gui/$(id -u)/com.ammar.imemd
@@ -385,7 +410,7 @@ real agent queries) the move from live LLM expansion to idf scoring went: hook h
 
 ## Agent contract (ai-review, on-call)
 
-The bots in `~/scratch` use imem from deterministic code and parse some of its output.
+The self-agent bots (ai-review, on-call) use imem from deterministic code and parse some of its output.
 `cmd/imem/contract_test.go` and `internal/daemon/server_test.go` pin each of these; change
 the agents before changing any of them:
 

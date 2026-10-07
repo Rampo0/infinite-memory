@@ -1,6 +1,6 @@
 services:
   memgraph:
-    image: memgraph/memgraph-mage:latest
+    image: memgraph/memgraph-mage@sha256:f252561ba38f4c5f530f9d0c7d916f47a37ed20fdfdcfd9b596ca149bd9a5fd8
     ports:
       - "127.0.0.1:7687:7687"
       - "127.0.0.1:7444:7444"
@@ -12,13 +12,13 @@ services:
   # Throwaway instance for make itest: no volume, only started under the
   # "test" profile, so integration fixtures never touch the live graph.
   memgraph-test:
-    image: memgraph/memgraph-mage:latest
+    image: memgraph/memgraph-mage@sha256:f252561ba38f4c5f530f9d0c7d916f47a37ed20fdfdcfd9b596ca149bd9a5fd8
     profiles: ["test"]
     ports:
       - "127.0.0.1:7688:7687"
     command: ["--log-level=WARNING", "--also-log-to-stderr"]
   lab:
-    image: memgraph/lab:latest
+    image: memgraph/lab@sha256:f288113adc4a30c7a59fcf064af729dffa728ae6c4b8a7d9287286de0ec41cd6
     ports:
       - "127.0.0.1:3000:3000"
     environment:

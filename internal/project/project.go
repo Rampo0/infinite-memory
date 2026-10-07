@@ -168,3 +168,44 @@ func PlanRepoKeys(keys []string, resolve func(string) (string, bool), findRepo f
 	}
 	return out, unresolved
 }
+
+func ExpandPrefixMaps(keys []string, prefixes, manual map[string]string) {
+	for _, k := range keys {
+		if _, ok := manual[k]; ok {
+			continue
+		}
+		for old, nw := range prefixes {
+			if k == old || strings.HasPrefix(k, old+"/") {
+				manual[k] = nw + strings.TrimPrefix(k, old)
+				break
+			}
+		}
+	}
+}
+
+func ForeignHome(keys []string, home string) string {
+	counts := map[string]int{}
+	for _, k := range keys {
+		if h := homeOf(k); h != "" && h != home {
+			counts[h]++
+		}
+	}
+	best, n := "", 0
+	for h, c := range counts {
+		if c > n || (c == n && h < best) {
+			best, n = h, c
+		}
+	}
+	return best
+}
+
+func homeOf(key string) string {
+	for _, base := range []string{"/Users/", "/home/"} {
+		if rest, ok := strings.CutPrefix(key, base); ok {
+			if user, _, _ := strings.Cut(rest, "/"); user != "" {
+				return base + user
+			}
+		}
+	}
+	return ""
+}

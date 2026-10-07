@@ -1,7 +1,7 @@
 package main
 
 // Contract tests for the CLI surface that the ai-review and on-call agents
-// (~/scratch/agentkit, ~/scratch/agents) depend on. They run the real binary
+// (self-agent: agentkit, agents/*) depend on. They run the real binary
 // entrypoint against a fake daemon and check stdout and exit code exactly as
 // the agents see them:
 //

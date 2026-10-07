@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -189,11 +190,7 @@ func normLimit(v, def int) int {
 // A broken or missing file never fails: hooks must work with zero setup.
 func Load() Config {
 	cfg := Default()
-	path := os.Getenv("IMEM_CONFIG")
-	if path == "" {
-		path = ExpandHome("~/.config/infinite-memory/config.json")
-	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(Path())
 	if err != nil {
 		return cfg
 	}
@@ -325,4 +322,48 @@ func ExpandHome(p string) string {
 		}
 	}
 	return p
+}
+
+func Path() string {
+	if p := os.Getenv("IMEM_CONFIG"); p != "" {
+		return p
+	}
+	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		return filepath.Join(x, "infinite-memory", "config.json")
+	}
+	return ExpandHome("~/.config/infinite-memory/config.json")
+}
+
+func AgentsDir() string { return filepath.Join(filepath.Dir(Path()), "agents.d") }
+
+type AgentDropIn struct {
+	Name string `json:"name"`
+	Root string `json:"root"`
+}
+
+func ReadDropIns(dir string) []AgentDropIn {
+	paths, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	sort.Strings(paths)
+	var out []AgentDropIn
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var d AgentDropIn
+		if json.Unmarshal(data, &d) != nil || strings.TrimSpace(d.Root) == "" {
+			continue
+		}
+		d.Root = filepath.Clean(ExpandHome(strings.TrimSpace(d.Root)))
+		out = append(out, d)
+	}
+	return out
+}
+
+func DropInRoots(dir string) []string {
+	var out []string
+	for _, d := range ReadDropIns(dir) {
+		out = append(out, d.Root)
+	}
+	return out
 }

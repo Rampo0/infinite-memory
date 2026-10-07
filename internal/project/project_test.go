@@ -139,3 +139,32 @@ func TestPlanRepoKeys(t *testing.T) {
 		t.Fatalf("only the worktree with no evidence is unresolved, got %v", unresolved)
 	}
 }
+
+func TestPrefixMapsBecomeKeyMaps(t *testing.T) {
+	keys := []string{"/Users/old/play/self-agent", "/Users/old/accountworkspace/registration", "/Users/oldish/x", "/other/y"}
+	manual := map[string]string{"/other/y": "/other/z"}
+	ExpandPrefixMaps(keys, map[string]string{"/Users/old": "/Users/new"}, manual)
+	want := map[string]string{
+		"/Users/old/play/self-agent":               "/Users/new/play/self-agent",
+		"/Users/old/accountworkspace/registration": "/Users/new/accountworkspace/registration",
+		"/other/y": "/other/z",
+	}
+	if len(manual) != len(want) {
+		t.Fatalf("got %v", manual)
+	}
+	for k, v := range want {
+		if manual[k] != v {
+			t.Fatalf("%s: want %s, got %s (prefix must match whole path segments)", k, v, manual[k])
+		}
+	}
+}
+
+func TestForeignHomeFindsTheOldMachinesHome(t *testing.T) {
+	keys := []string{"/Users/old/a", "/Users/old/b/c", "/Users/new/d", "/itest/1", "/Users/old/e"}
+	if got := ForeignHome(keys, "/Users/new"); got != "/Users/old" {
+		t.Fatalf("got %q", got)
+	}
+	if got := ForeignHome([]string{"/Users/new/a"}, "/Users/new"); got != "" {
+		t.Fatalf("no foreign home, got %q", got)
+	}
+}
