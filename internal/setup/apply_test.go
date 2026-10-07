@@ -191,3 +191,16 @@ func TestDoctorFlagsSettingsWithoutImemHooks(t *testing.T) {
 		}
 	}
 }
+
+func TestDoctorListsEachAgentRootOnce(t *testing.T) {
+	e, _ := testEnv(t)
+	dir := t.TempDir()
+	t.Setenv("IMEM_CONFIG", filepath.Join(dir, "config.json"))
+	_ = os.MkdirAll(filepath.Join(dir, "agents.d"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "agents.d", "bot.json"), []byte(`{"name": "bot", "root": "/a/bot/imem"}`), 0o644)
+	e.Cfg = config.Config{AgentRoots: []string{"/a/bot/imem"}}
+	got := checkAgents(e)
+	if !strings.HasPrefix(got.Detail, "1 agent transcript root(s)") {
+		t.Fatalf("a root registered twice is still one root: %q", got.Detail)
+	}
+}

@@ -70,6 +70,13 @@ func checkLaunchd(e Env) Check {
 }
 
 func checkAgents(e Env) Check {
-	roots := append(append([]string(nil), e.Cfg.AgentRoots...), config.DropInRoots(config.AgentsDir())...)
+	var roots []string
+	seen := map[string]bool{}
+	for _, r := range append(append([]string(nil), e.Cfg.AgentRoots...), config.DropInRoots(config.AgentsDir())...) {
+		if !seen[r] {
+			seen[r] = true
+			roots = append(roots, r)
+		}
+	}
 	return Check{Name: "agents", OK: true, Detail: fmt.Sprintf("%d agent transcript root(s): %s", len(roots), strings.Join(roots, ", "))}
 }
