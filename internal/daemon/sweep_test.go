@@ -57,8 +57,8 @@ func TestSweepPicksIdleSessionsWithUnreadLines(t *testing.T) {
 		{ID: "active", TranscriptPath: active, CWD: "/c", Cursor: 1, UpdatedAt: idle.Add(-time.Hour).Unix()},
 	}, now)
 	sw.run(context.Background())
-	if len(*got) != 1 || (*got)[0].SessionID != "behind" || !(*got)[0].Final {
-		t.Fatalf("want only the idle session with unread lines, as a final job: %+v", *got)
+	if len(*got) != 1 || (*got)[0].SessionID != "behind" {
+		t.Fatalf("want only the idle session with unread lines: %+v", *got)
 	}
 }
 
@@ -85,5 +85,23 @@ func TestSweepCarriesTheAgentFlag(t *testing.T) {
 	sw.run(context.Background())
 	if len(*got) != 1 || !(*got)[0].Agent {
 		t.Fatalf("a bot transcript must stay flagged: %+v", *got)
+	}
+}
+
+func TestSweepTreatsOnlyLongIdleSessionsAsFinal(t *testing.T) {
+	now := time.Now()
+	recent := transcriptLines(t, 5, now.Add(-10*time.Minute))
+	old := transcriptLines(t, 5, now.Add(-2*time.Hour))
+	sw, got := testSweeper([]graph.SessionSource{
+		{ID: "recent", TranscriptPath: recent, CWD: "/c", Cursor: 3},
+		{ID: "old", TranscriptPath: old, CWD: "/c", Cursor: 3},
+	}, now)
+	sw.run(context.Background())
+	final := map[string]bool{}
+	for _, j := range *got {
+		final[j.SessionID] = j.Final
+	}
+	if len(*got) != 2 || final["recent"] || !final["old"] {
+		t.Fatalf("a session paused for minutes may go on; only a long-idle one gets its short tail saved: %+v", *got)
 	}
 }

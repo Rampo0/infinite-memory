@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	sweepEvery    = 10 * time.Minute
-	sweepBootWait = time.Minute
-	sweepIdle     = 3 * time.Minute
-	sweepHorizon  = 7 * 24 * time.Hour
+	sweepEvery     = 10 * time.Minute
+	sweepBootWait  = time.Minute
+	sweepIdle      = 3 * time.Minute
+	sweepFinalIdle = 30 * time.Minute
+	sweepHorizon   = 7 * 24 * time.Hour
 )
 
 type sweepStore interface {
@@ -36,25 +37,31 @@ func (sw *sweeper) run(ctx context.Context) int {
 	}
 	n := 0
 	for _, c := range cands {
-		if !sw.behind(c) {
+		idle, ok := sw.behind(c)
+		if !ok {
 			continue
 		}
-		sw.notify("sweep", Job{SessionID: c.ID, TranscriptPath: c.TranscriptPath, CWD: c.CWD, Agent: c.Agent, Final: true})
+		sw.notify("sweep", Job{SessionID: c.ID, TranscriptPath: c.TranscriptPath, CWD: c.CWD, Agent: c.Agent,
+			Final: idle >= sweepFinalIdle})
 		n++
 	}
 	return n
 }
 
-func (sw *sweeper) behind(c graph.SessionSource) bool {
+func (sw *sweeper) behind(c graph.SessionSource) (time.Duration, bool) {
 	if sw.ignored(c.CWD) || !sw.valid(c.TranscriptPath) {
-		return false
+		return 0, false
 	}
 	fi, err := os.Stat(c.TranscriptPath)
-	if err != nil || sw.now().Sub(fi.ModTime()) < sw.idle || fi.ModTime().Unix() <= c.UpdatedAt {
-		return false
+	if err != nil {
+		return 0, false
+	}
+	idle := sw.now().Sub(fi.ModTime())
+	if idle < sw.idle || fi.ModTime().Unix() <= c.UpdatedAt {
+		return 0, false
 	}
 	lines, err := extract.CountLines(c.TranscriptPath)
-	return err == nil && lines > c.Cursor
+	return idle, err == nil && lines > c.Cursor
 }
 
 func (s *server) startSweepLoop() {

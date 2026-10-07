@@ -235,8 +235,9 @@ every escaped statement.
   so. Above `extract_max_usage` (default 0.85 of the 5-hour window, probed every 10 min)
   extraction is deferred, not skipped. Every 10 minutes the daemon **sweeps** sessions seen
   in the last 7 days whose transcript has lines past the cursor and has been idle for 3
-  minutes, and extracts them — a missed Stop, a daemon restart or a session that never
-  sent SessionEnd still gets saved.
+  minutes, and extracts them (a short closing exchange only once the session has been
+  idle for 30 minutes) — a missed Stop, a daemon restart or a session that never sent
+  SessionEnd still gets saved.
 - **Agent transcripts**: a transcript outside `~/.claude/projects` is only accepted from
   a configured `agent_roots` directory (symlinks resolved), is extracted in isolated mode
   (no MCP servers, settings or tools), never saves a `rule` or `preference` (those become

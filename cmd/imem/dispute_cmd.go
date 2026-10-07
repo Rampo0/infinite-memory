@@ -31,6 +31,10 @@ func cmdDispute(args []string) {
 	defer cancel()
 	targets, err := store.MemoryTargets(ctx, q)
 	target, ok := pickPinTarget(targets, q)
+	if err == nil && len(targets) == 0 {
+		fmt.Fprintf(os.Stderr, "no live memory matches %q\n", q)
+		os.Exit(1)
+	}
 	if err != nil || !ok {
 		reportPinChoices(targets, q)
 		os.Exit(1)
