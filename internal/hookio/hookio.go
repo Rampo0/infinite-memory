@@ -16,8 +16,9 @@ type Input struct {
 	HookEventName  string `json:"hook_event_name"`
 	UserPrompt     string `json:"user_prompt"`
 	// Prompt is a fallback for older Claude Code builds that used "prompt".
-	Prompt         string `json:"prompt"`
-	StopHookActive bool   `json:"stop_hook_active"`
+	Prompt               string `json:"prompt"`
+	StopHookActive       bool   `json:"stop_hook_active"`
+	LastAssistantMessage string `json:"last_assistant_message"`
 	// Source is SessionStart's trigger: startup, resume, clear or compact.
 	Source string `json:"source"`
 }

@@ -42,6 +42,7 @@ type SavedPayload struct {
 	Batches int    `json:"batches"`
 	MS      int64  `json:"ms"`
 	Status  string `json:"status"` // "" | "running" | "skipped"
+	Note    string `json:"note"`
 	Error   string `json:"error"`
 	DueInS  int    `json:"due_in_s"`
 }

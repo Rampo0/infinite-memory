@@ -5,6 +5,8 @@
   "memgraph_pass": "",
   "claude_bin": "claude",
   "extract_model": "claude-opus-5",
+  "extract_effort": "high",
+  "extract_max_usage": 0.85,
   "expand_enabled": false,
   "expand_model": "claude-haiku-4-5-20251001",
   "retrieve_k": 10,

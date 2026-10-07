@@ -996,3 +996,34 @@ func TestPinRulesAndPreferencesOnly(t *testing.T) {
 		t.Fatalf("an exact id must find the pinned rule, got %+v", again)
 	}
 }
+
+func TestTouchSessionFeedsTheSweep(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d", time.Now().UnixNano())
+	sid := fmt.Sprintf("sweep-%d", time.Now().UnixNano())
+	now := time.Now().Unix()
+	src := SessionSource{ID: sid, ProjectKey: pk, TranscriptPath: "/tmp/" + sid + ".jsonl", CWD: "/c", Agent: true}
+	if err := s.TouchSession(ctx, src, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchSession(ctx, SessionSource{ID: sid, ProjectKey: pk, TranscriptPath: src.TranscriptPath, CWD: "/c"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetCursor(ctx, sid, pk, 7, now); err != nil {
+		t.Fatal(err)
+	}
+	cands, err := s.SweepCandidates(ctx, now-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cands {
+		if c.ID == sid {
+			if c.TranscriptPath != src.TranscriptPath || !c.Agent || c.Cursor != 7 || c.UpdatedAt != now {
+				t.Fatalf("sweep candidate misread (agent must stay sticky): %+v", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("touched session %s missing from the sweep", sid)
+}

@@ -77,3 +77,10 @@ func TestStandingMessageNamesTheRulesFile(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestSavedMessageNamesTheDeferral(t *testing.T) {
+	got := savedMessage(client.SavedPayload{Status: "deferred", Note: "deferred: 5-hour usage 90% is over extract_max_usage 85%"})
+	if got != "imem: save deferred: 5-hour usage 90% is over extract_max_usage 85%" {
+		t.Fatalf("got %q", got)
+	}
+}

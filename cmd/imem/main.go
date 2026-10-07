@@ -259,12 +259,18 @@ func retrieveMessage(cfg config.Config, resp client.RetrieveResponse, err error,
 	return msg
 }
 
+const finalReplyWait = 5 * time.Second
+
 func hookStop(cfg config.Config, in hookio.Input) {
-	if in.StopHookActive {
-		return
-	}
 	req := client.ExtractRequest{
 		SessionID: in.SessionID, TranscriptPath: in.TranscriptPath, CWD: in.CWD, Source: "stop", Agent: headless(),
+	}
+	if in.StopHookActive {
+		_, _ = client.NotifyExtract(cfg.BaseURL(), req, 500*time.Millisecond)
+		return
+	}
+	if !req.Agent {
+		waitForReply(in.TranscriptPath, in.LastAssistantMessage, finalReplyWait)
 	}
 	if cfg.HookFlushOnStop && !req.Agent {
 		// Blocking: force extraction now so the line describes THIS turn.
@@ -286,6 +292,19 @@ func hookStop(cfg config.Config, in hookio.Input) {
 		req.BudgetMS = 0
 	}
 	_, _ = client.NotifyExtract(cfg.BaseURL(), req, 500*time.Millisecond)
+}
+
+func waitForReply(path, reply string, limit time.Duration) {
+	if path == "" {
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	deadline := time.Now().Add(limit)
+	for !extract.HasFinalReply(path, reply) && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // hookStanding injects the standing rules once per session (also after
@@ -333,6 +352,8 @@ func savedMessage(p client.SavedPayload) string {
 		msg = fmt.Sprintf("imem: saved %d %s (%.1fs)", p.Count, noun, float64(p.MS)/1000)
 	case p.Status == "running":
 		msg = "imem: extracting… (report at next prompt)"
+	case p.Status == "deferred":
+		msg = "imem: save " + p.Note
 	case p.Status == "skipped":
 		msg = "imem: saved nothing — no new facts this turn"
 	case p.DueInS > 0:

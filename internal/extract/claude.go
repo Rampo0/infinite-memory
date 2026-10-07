@@ -84,10 +84,11 @@ type Runner struct {
 	Bin      string
 	Model    string
 	SpawnDir string
+	Effort   string
 }
 
 func NewRunner(cfg config.Config) *Runner {
-	return &Runner{Bin: cfg.ClaudeBin, Model: cfg.ExtractModel, SpawnDir: cfg.SpawnDir()}
+	return &Runner{Bin: cfg.ClaudeBin, Model: cfg.ExtractModel, SpawnDir: cfg.SpawnDir(), Effort: cfg.ExtractEffort}
 }
 
 // binFallbacks are tried in order when claude is not on PATH. The daemon
@@ -138,12 +139,11 @@ type Request struct {
 }
 
 // Run executes one extraction and returns the model's raw result text.
-// The caller owns the context deadline (120s recommended). isolated is for
-// transcripts that are not the user's own (see Request.Isolated).
-func (r *Runner) Run(ctx context.Context, prompt string, isolated bool) (string, error) {
+// The caller owns the context deadline (120s recommended).
+func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 	return r.RunSchema(ctx, Request{
 		Prompt: prompt, Schema: ExtractionSchema, SystemPrompt: systemPrompt, Append: true,
-		Isolated: isolated,
+		Isolated: true, Effort: r.Effort,
 	})
 }
 

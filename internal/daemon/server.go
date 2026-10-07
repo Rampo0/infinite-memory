@@ -45,6 +45,7 @@ type server struct {
 	byKind func(ctx context.Context, kind string) ([]graph.Candidate, error)
 	// saveBatch writes memories (Store.SaveBatch; a func field for tests).
 	saveBatch func(ctx context.Context, pk, sid string, now int64, mems []graph.MemoryIn) ([]graph.SaveOutcome, error)
+	touch     func(ctx context.Context, src graph.SessionSource, now int64) error
 
 	schemaMu sync.Mutex
 	schemaOK bool
@@ -90,6 +91,7 @@ func Run(cfg config.Config) error {
 			return store.ByKind(ctx, kind, -1)
 		},
 		saveBatch: store.SaveBatch,
+		touch:     store.TouchSession,
 		log:       log,
 	}
 	if cfg.RulesOnSessionStart {
@@ -121,9 +123,11 @@ func Run(cfg config.Config) error {
 	}
 	s.expander = s.newExpander(worker.Runner)
 	s.queue = NewQueue(cfg.Debounce(), worker.Process, log)
+	worker.Requeue = s.queue.enqueue
 	s.queue.OnPending = s.saves.MarkPending
 	s.queue.Start()
 
+	s.startSweepLoop()
 	if cfg.BackupEnabled {
 		s.startBackupLoop()
 	}
@@ -602,10 +606,26 @@ func (s *server) handleExtract(w http.ResponseWriter, r *http.Request) {
 	if source != "session_end" {
 		source = "stop"
 	}
-	s.queue.Notify(source, req.job())
+	job := req.job()
+	job.Final = source == "session_end"
+	s.rememberSource(job)
+	s.queue.Notify(source, job)
 	// Notify ran first, so the drain below already sees the new due time.
 	saved := s.saves.Drain(req.SessionID, s.cfg.HookSavedLines)
 	writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "saved": saved})
+}
+
+func (s *server) rememberSource(j Job) {
+	if s.touch == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	src := graph.SessionSource{ID: j.SessionID, ProjectKey: project.ResolveKey(j.CWD),
+		TranscriptPath: j.TranscriptPath, CWD: j.CWD, Agent: j.Agent}
+	if err := s.touch(ctx, src, time.Now().Unix()); err != nil {
+		s.log.Warn("session source not recorded", "session", j.SessionID, "err", err)
+	}
 }
 
 // validTranscriptPath only accepts real files under ~/.claude/projects or a
@@ -724,6 +744,9 @@ func (s *server) handleFlush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	budget := time.Duration(req.BudgetMS) * time.Millisecond
+	if req.TranscriptPath != "" {
+		s.rememberSource(req.job())
+	}
 	done, err := s.queue.FlushBudget(req.job(), budget)
 	// Drained AFTER the flush so this run's own report is included. The
 	// error travels inside "saved" with a 200: the hook has to render a

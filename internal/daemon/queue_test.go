@@ -200,3 +200,15 @@ func TestQueueAgentFlagOnlyEverDemotes(t *testing.T) {
 		}
 	}
 }
+
+func TestQueueSweepRunsAtOnce(t *testing.T) {
+	rec := &recorder{done: make(chan struct{}, 8)}
+	q := newTestQueue(10*time.Second, rec)
+	defer q.Stop()
+	q.Notify("sweep", Job{SessionID: "s9", TranscriptPath: "/t", CWD: "/c", Final: true})
+	select {
+	case <-rec.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a sweep must enqueue immediately, not wait for a debounce")
+	}
+}

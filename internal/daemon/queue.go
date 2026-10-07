@@ -20,6 +20,7 @@ type Job struct {
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
 	Agent          bool   `json:"agent,omitempty"`
+	Final          bool   `json:"final,omitempty"`
 }
 
 func (j Job) keepAgent(prev Job) Job {
@@ -79,7 +80,7 @@ func (q *Queue) Notify(source string, j Job) {
 	p := q.ensureLocked(j.SessionID)
 	j = j.keepAgent(p.job)
 	p.job = j
-	if source == "session_end" {
+	if source == "session_end" || source == "sweep" {
 		if p.timer != nil {
 			p.timer.Stop()
 			p.timer = nil
@@ -237,8 +238,17 @@ func (q *Queue) worker() {
 
 // Worker is the extraction pipeline: transcript delta -> prompt -> headless
 // claude -> parse -> save -> cursor advance.
+type workerStore interface {
+	GetCursor(ctx context.Context, sid string) (int64, error)
+	SetCursor(ctx context.Context, sid, pk string, line, now int64) error
+	EntityNames(ctx context.Context, pk string, limit int) ([]string, error)
+	EntityNamesGlobal(ctx context.Context, limit int) ([]string, error)
+	SaveBatch(ctx context.Context, pk, sid string, now int64, mems []graph.MemoryIn) ([]graph.SaveOutcome, error)
+	ApplyFeedback(ctx context.Context, now int64, vs []graph.Verdict) error
+}
+
 type Worker struct {
-	Store  *graph.Store
+	Store  workerStore
 	Runner *extract.Runner
 	Cfg    config.Config
 	Log    *slog.Logger
@@ -252,19 +262,30 @@ type Worker struct {
 	// the extractor to grade (B2). Nil skips feedback.
 	Shown func(sid string, since int64) []extract.Known
 
-	mu      sync.Mutex
-	fails   map[string]int
-	lastRun map[string]int64 // per session: start of the last successful run
+	Spawn   func(ctx context.Context, prompt string) (string, error)
+	Usage   func(ctx context.Context) (float64, error)
+	Requeue func(j Job)
+
+	mu       sync.Mutex
+	fails    map[string]int
+	lastRun  map[string]int64 // per session: start of the last successful run
+	cooldown map[string]int64
+	shrink   map[string]int
 }
 
 func NewWorker(store *graph.Store, cfg config.Config, log *slog.Logger) *Worker {
+	runner := extract.NewRunner(cfg)
 	return &Worker{
-		Store:   store,
-		Runner:  extract.NewRunner(cfg),
-		Cfg:     cfg,
-		Log:     log,
-		fails:   map[string]int{},
-		lastRun: map[string]int64{},
+		Store:    store,
+		Runner:   runner,
+		Cfg:      cfg,
+		Log:      log,
+		Spawn:    runner.Run,
+		Usage:    cachedUsage(usageProbe(runner, cfg.ExpandModel), 10*time.Minute, time.Now),
+		fails:    map[string]int{},
+		lastRun:  map[string]int64{},
+		cooldown: map[string]int64{},
+		shrink:   map[string]int{},
 	}
 }
 
@@ -301,96 +322,168 @@ func clipErr(err error) string {
 	return s
 }
 
+type step int
+
+const (
+	stepAdvance step = iota
+	stepDefer
+	stepExtract
+)
+
+const (
+	failsBeforeCooldown = 3
+	baseCooldown        = 30 * time.Minute
+	maxCooldown         = 24 * time.Hour
+)
+
+type attempt struct {
+	j     Job
+	pk    string
+	chunk extract.Chunk
+	from  int
+	now   int64
+}
+
+func planDelta(c extract.Chunk, j Job) step {
+	if len(c.Turns) == 0 {
+		return stepAdvance
+	}
+	if extract.TotalChars(c.Turns) < minDeltaChars && !j.Final && !j.Agent {
+		return stepDefer
+	}
+	return stepExtract
+}
+
 func (w *Worker) process(j Job) (SaveReport, error) {
 	var rep SaveReport
 	ctx := context.Background()
-	pk := project.ResolveKey(j.CWD)
-	now := time.Now().Unix()
-
-	cur64, err := w.Store.GetCursor(ctx, j.SessionID)
+	if msg := w.coolingDown(j.SessionID); msg != "" {
+		rep.Error = msg
+		return rep, nil
+	}
+	a, err := w.readAttempt(ctx, j)
 	if err != nil {
-		return rep, fmt.Errorf("get cursor: %w", err)
+		return rep, err
 	}
-	cur := int(cur64)
-
-	turns, total, err := extract.ReadDelta(j.TranscriptPath, cur, w.Cfg.MaxTranscriptChars)
-	if err != nil {
-		return rep, fmt.Errorf("read transcript: %w", err)
-	}
-	if cur > total {
-		w.Log.Warn("cursor beyond transcript, resetting", "session", j.SessionID, "cursor", cur, "lines", total)
-		turns, total, err = extract.ReadDelta(j.TranscriptPath, 0, w.Cfg.MaxTranscriptChars)
-		if err != nil {
-			return rep, fmt.Errorf("read transcript: %w", err)
-		}
-	}
-
-	if extract.TotalChars(turns) < minDeltaChars {
-		// Quiet: this fires on nearly every short turn, and a "nothing to
-		// save" line on each would be pure noise.
-		w.Log.Debug("delta too small, skipping spawn", "session", j.SessionID, "lines", total)
+	switch planDelta(a.chunk, j) {
+	case stepAdvance:
 		rep.quiet = true
-		return rep, w.Store.SetCursor(ctx, j.SessionID, pk, int64(total), now)
+		return rep, w.Store.SetCursor(ctx, j.SessionID, a.pk, int64(a.chunk.Next), a.now)
+	case stepDefer:
+		w.Log.Info("short delta deferred", "session", j.SessionID, "chars", extract.TotalChars(a.chunk.Turns))
+		rep.quiet = true
+		return rep, nil
 	}
+	if reason := w.overUsage(ctx); reason != "" {
+		w.Log.Info("extraction deferred", "session", j.SessionID, "reason", reason)
+		rep.Skipped = reason
+		return rep, nil
+	}
+	return w.extract(ctx, a)
+}
 
+func (w *Worker) readAttempt(ctx context.Context, j Job) (attempt, error) {
+	a := attempt{j: j, pk: project.ResolveKey(j.CWD), now: time.Now().Unix()}
+	cur, err := w.Store.GetCursor(ctx, j.SessionID)
+	if err != nil {
+		return a, fmt.Errorf("get cursor: %w", err)
+	}
+	a.from = int(cur)
+	budget := w.budget(j.SessionID)
+	a.chunk, err = extract.ReadChunk(j.TranscriptPath, a.from, budget)
+	if err == nil && a.from > a.chunk.Total {
+		w.Log.Warn("cursor beyond transcript, resetting", "session", j.SessionID, "cursor", a.from, "lines", a.chunk.Total)
+		a.from = 0
+		a.chunk, err = extract.ReadChunk(j.TranscriptPath, 0, budget)
+	}
+	if err != nil {
+		return a, fmt.Errorf("read transcript: %w", err)
+	}
+	return a, nil
+}
+
+func (w *Worker) budget(sid string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if b, ok := w.shrink[sid]; ok {
+		return b
+	}
+	return w.Cfg.MaxTranscriptChars
+}
+
+func (w *Worker) extract(ctx context.Context, a attempt) (SaveReport, error) {
+	var rep SaveReport
+	foreign := isForeign(a.j)
+	pc := w.promptContext(ctx, a, foreign)
+	prompt := extract.BuildPromptWith(a.pk, w.knownEntities(ctx, a.pk), a.chunk.Turns, pc)
+	spawnCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	w.Log.Info("extracting", "session", a.j.SessionID, "turns", len(a.chunk.Turns), "from_line", a.from,
+		"to_line", a.chunk.Next, "lines", a.chunk.Total, "model", w.Cfg.ExtractModel, "agent", foreign)
+	raw, err := w.Spawn(spawnCtx, prompt)
+	if err != nil {
+		return rep, w.fail(a, fmt.Errorf("claude: %w", err))
+	}
+	mems, verdicts, err := planExtraction(raw, foreign, knownIDs(pc.Existing), knownIDs(pc.Shown))
+	if err != nil {
+		return rep, w.fail(a, fmt.Errorf("parse: %w", err))
+	}
+	rep, err = w.persist(ctx, a, mems, verdicts)
+	if err != nil {
+		return rep, w.fail(a, err)
+	}
+	return rep, w.advance(ctx, a, len(mems))
+}
+
+func (w *Worker) knownEntities(ctx context.Context, pk string) []string {
 	known, err := w.Store.EntityNames(ctx, pk, 20)
 	if err != nil {
 		w.Log.Warn("entity names fetch failed", "err", err)
 		known = nil
 	}
-	if global, err := w.Store.EntityNamesGlobal(ctx, 15); err == nil {
-		seen := make(map[string]bool, len(known))
-		for _, n := range known {
-			seen[strings.ToLower(n)] = true
-		}
-		for _, n := range global {
-			if !seen[strings.ToLower(n)] {
-				known = append(known, n)
-			}
+	global, err := w.Store.EntityNamesGlobal(ctx, 15)
+	if err != nil {
+		return known
+	}
+	seen := make(map[string]bool, len(known))
+	for _, n := range known {
+		seen[strings.ToLower(n)] = true
+	}
+	for _, n := range global {
+		if !seen[strings.ToLower(n)] {
+			known = append(known, n)
 		}
 	}
+	return known
+}
 
-	// Fails closed: anything not from ~/.claude/projects is an agent's
-	// transcript, even a path that no longer resolves into an agent root since
-	// it was validated, and so is any session a hook flagged as headless
-	// (claude -p, SDK agents) — the flag only ever demotes. It is extracted
-	// isolated, its rules are demoted, and it never reconciles against or
-	// grades the user's memories.
-	foreign := isForeign(j)
-
+func (w *Worker) promptContext(ctx context.Context, a attempt, foreign bool) extract.PromptContext {
 	var pc extract.PromptContext
-	if !foreign {
-		if w.Similar != nil {
-			if sim, err := w.Similar(ctx, pk, deltaTokens(turns)); err == nil {
-				pc.Existing = sim
-			} else {
-				w.Log.Warn("similar memories lookup failed", "err", err)
-			}
-		}
-		if w.Shown != nil {
-			w.mu.Lock()
-			since := w.lastRun[j.SessionID]
-			w.mu.Unlock()
-			pc.Shown = w.Shown(j.SessionID, since)
+	if foreign {
+		return pc
+	}
+	if w.Similar != nil {
+		if sim, err := w.Similar(ctx, a.pk, deltaTokens(a.chunk.Turns)); err == nil {
+			pc.Existing = sim
+		} else {
+			w.Log.Warn("similar memories lookup failed", "err", err)
 		}
 	}
-	prompt := extract.BuildPromptWith(pk, known, turns, pc)
-	spawnCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
+	if w.Shown != nil {
+		w.mu.Lock()
+		since := w.lastRun[a.j.SessionID]
+		w.mu.Unlock()
+		pc.Shown = w.Shown(a.j.SessionID, since)
+	}
+	return pc
+}
 
-	w.Log.Info("extracting", "session", j.SessionID, "turns", len(turns), "from_line", cur, "to_line", total, "model", w.Runner.Model, "isolated", foreign)
-	raw, err := w.Runner.Run(spawnCtx, prompt, foreign)
-	if err != nil {
-		return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("claude: %w", err))
-	}
-	mems, verdicts, err := planExtraction(raw, foreign, knownIDs(pc.Existing), knownIDs(pc.Shown))
-	if err != nil {
-		return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("parse: %w", err))
-	}
+func (w *Worker) persist(ctx context.Context, a attempt, mems []graph.MemoryIn, verdicts []graph.Verdict) (SaveReport, error) {
+	var rep SaveReport
 	if len(mems) > 0 {
-		saved, err := w.Store.SaveBatch(ctx, pk, j.SessionID, now, mems)
+		saved, err := w.Store.SaveBatch(ctx, a.pk, a.j.SessionID, a.now, mems)
 		if err != nil {
-			return rep, w.fail(ctx, j.SessionID, pk, total, now, fmt.Errorf("save: %w", err))
+			return rep, fmt.Errorf("save: %w", err)
 		}
 		for _, o := range saved {
 			rep.Memories = append(rep.Memories, SavedMemory{
@@ -399,52 +492,83 @@ func (w *Worker) process(j Job) (SaveReport, error) {
 		}
 	}
 	if len(verdicts) > 0 {
-		// Best effort: a lost grade costs ranking, not correctness.
-		if err := w.Store.ApplyFeedback(ctx, now, verdicts); err != nil {
+		if err := w.Store.ApplyFeedback(ctx, a.now, verdicts); err != nil {
 			w.Log.Warn("feedback not applied", "err", err)
 		} else {
-			w.Log.Info("feedback", "session", j.SessionID, "verdicts", len(verdicts))
+			w.Log.Info("feedback", "session", a.j.SessionID, "verdicts", len(verdicts))
 		}
 	}
 	if len(rep.Memories) == 0 {
 		rep.Skipped = "nothing worth saving"
 	}
-
-	w.mu.Lock()
-	delete(w.fails, j.SessionID)
-	w.lastRun[j.SessionID] = now
-	w.mu.Unlock()
-
-	if err := w.Store.SetCursor(ctx, j.SessionID, pk, int64(total), now); err != nil {
-		return rep, fmt.Errorf("set cursor: %w", err)
-	}
-	w.Log.Info("extracted", "session", j.SessionID, "memories", len(mems), "cursor", total)
 	return rep, nil
 }
 
-func isForeign(j Job) bool {
-	return j.Agent || !fromClaudeProjects(j.TranscriptPath)
+func (w *Worker) advance(ctx context.Context, a attempt, saved int) error {
+	sid := a.j.SessionID
+	w.mu.Lock()
+	delete(w.fails, sid)
+	delete(w.shrink, sid)
+	delete(w.cooldown, sid)
+	w.lastRun[sid] = a.now
+	w.mu.Unlock()
+	if err := w.Store.SetCursor(ctx, sid, a.pk, int64(a.chunk.Next), a.now); err != nil {
+		return fmt.Errorf("set cursor: %w", err)
+	}
+	w.Log.Info("extracted", "session", sid, "memories", saved, "cursor", a.chunk.Next, "lines", a.chunk.Total)
+	if a.chunk.Next < a.chunk.Total && w.Requeue != nil {
+		w.Requeue(a.j)
+	}
+	return nil
 }
 
-// fail keeps the cursor untouched so the next Stop retries the delta; after
-// 3 consecutive failures the delta is skipped (poison-pill guard).
-func (w *Worker) fail(ctx context.Context, sid, pk string, total int, now int64, cause error) error {
+func (w *Worker) overUsage(ctx context.Context) string {
+	if w.Usage == nil || w.Cfg.ExtractMaxUsage <= 0 {
+		return ""
+	}
+	u, err := w.Usage(ctx)
+	if err != nil || u < w.Cfg.ExtractMaxUsage {
+		return ""
+	}
+	return fmt.Sprintf("deferred: 5-hour usage %.0f%% is over extract_max_usage %.0f%%", u*100, w.Cfg.ExtractMaxUsage*100)
+}
+
+func (w *Worker) coolingDown(sid string) string {
+	w.mu.Lock()
+	until, n := w.cooldown[sid], w.fails[sid]
+	w.mu.Unlock()
+	if until == 0 || time.Now().Unix() >= until {
+		return ""
+	}
+	return fmt.Sprintf("saving paused after %d failed extractions, next try %s", n, time.Unix(until, 0).Format("15:04"))
+}
+
+func (w *Worker) fail(a attempt, cause error) error {
+	sid := a.j.SessionID
 	w.mu.Lock()
 	w.fails[sid]++
 	n := w.fails[sid]
-	w.mu.Unlock()
-	if n >= 3 {
-		w.Log.Error("3 consecutive failures, skipping delta", "session", sid, "err", cause)
-		w.mu.Lock()
-		delete(w.fails, sid)
-		w.mu.Unlock()
-		if err := w.Store.SetCursor(ctx, sid, pk, int64(total), now); err != nil {
-			w.Log.Error("cursor skip failed", "err", err)
-		}
-		return cause
+	w.shrink[sid] = max(extract.TotalChars(a.chunk.Turns)/2, 1)
+	if n >= failsBeforeCooldown {
+		w.cooldown[sid] = a.now + int64(cooldownFor(n)/time.Second)
 	}
-	w.Log.Warn("extraction failed, will retry", "session", sid, "attempt", n, "err", cause)
+	w.mu.Unlock()
+	w.Log.Warn("extraction failed, cursor kept", "session", sid, "attempt", n, "turns", len(a.chunk.Turns), "err", cause)
 	return cause
+}
+
+func cooldownFor(fails int) time.Duration {
+	return min(baseCooldown<<min(fails-failsBeforeCooldown, 6), maxCooldown)
+}
+
+// Fails closed: anything not from ~/.claude/projects is an agent's
+// transcript, even a path that no longer resolves into an agent root since
+// it was validated, and so is any session a hook flagged as headless
+// (claude -p, SDK agents) — the flag only ever demotes. It is extracted
+// isolated, its rules are demoted, and it never reconciles against or
+// grades the user's memories.
+func isForeign(j Job) bool {
+	return j.Agent || !fromClaudeProjects(j.TranscriptPath)
 }
 
 // planExtraction turns the extractor's reply into what to write. Interactive

@@ -16,12 +16,13 @@ func fixture(t *testing.T) string {
 	return p
 }
 
-func TestReadDeltaFull(t *testing.T) {
-	turns, total, err := ReadDelta(fixture(t), 0, 0)
+func TestReadChunkFull(t *testing.T) {
+	c, err := ReadChunk(fixture(t), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 9 {
+	turns, total := c.Turns, c.Total
+	if total != 9 || c.Next != 9 {
 		t.Fatalf("want 9 total lines, got %d", total)
 	}
 	if len(turns) != 2 {
@@ -35,11 +36,12 @@ func TestReadDeltaFull(t *testing.T) {
 	}
 }
 
-func TestReadDeltaCursor(t *testing.T) {
-	turns, total, err := ReadDelta(fixture(t), 2, 0)
+func TestReadChunkCursor(t *testing.T) {
+	c, err := ReadChunk(fixture(t), 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	turns, total := c.Turns, c.Total
 	if total != 9 {
 		t.Fatalf("total should still be 9, got %d", total)
 	}
@@ -48,18 +50,28 @@ func TestReadDeltaCursor(t *testing.T) {
 	}
 }
 
-func TestReadDeltaBudgetKeepsNewest(t *testing.T) {
-	turns, _, err := ReadDelta(fixture(t), 0, 60)
+func TestReadChunkBudgetKeepsOldestAndPointsAtTheRest(t *testing.T) {
+	c, err := ReadChunk(fixture(t), 0, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(turns) != 1 || turns[0].Role != "assistant" {
-		t.Fatalf("budget should keep only the newest turn, got %+v", turns)
+	if len(c.Turns) != 1 || c.Turns[0].Role != "user" {
+		t.Fatalf("budget should keep the oldest turn, got %+v", c.Turns)
+	}
+	if c.Next != 3 || c.Total != 9 {
+		t.Fatalf("next cursor must point at the first turn left out: next=%d total=%d", c.Next, c.Total)
+	}
+	rest, err := ReadChunk(fixture(t), c.Next, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest.Turns) != 1 || rest.Turns[0].Role != "assistant" || rest.Next != 9 {
+		t.Fatalf("the rest must come through on the next read: %+v next=%d", rest.Turns, rest.Next)
 	}
 }
 
-func TestReadDeltaMissingFile(t *testing.T) {
-	if _, _, err := ReadDelta("/nonexistent/nope.jsonl", 0, 0); err == nil {
+func TestReadChunkMissingFile(t *testing.T) {
+	if _, err := ReadChunk("/nonexistent/nope.jsonl", 0, 0); err == nil {
 		t.Fatal("want error for missing file")
 	}
 }
@@ -67,7 +79,7 @@ func TestReadDeltaMissingFile(t *testing.T) {
 // agentkit.imem.save (ai-review, on-call) writes its transcripts by hand: a
 // user line with a plain-string context, then assistant text blocks. Both
 // must come through as turns, or every bot save extracts from nothing.
-func TestReadDeltaAgentkitFormat(t *testing.T) {
+func TestReadChunkAgentkitFormat(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "ai-review-1014-04833db1afd6-dfb1a93d.jsonl")
 	data := `{"type": "user", "message": {"role": "user", "content": "ai-review comments on MR !1014"}}` + "\n" +
 		`{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Missing nil check before Deref."}]}}` + "\n" +
@@ -75,10 +87,11 @@ func TestReadDeltaAgentkitFormat(t *testing.T) {
 	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	turns, total, err := ReadDelta(p, 0, 24000)
+	c, err := ReadChunk(p, 0, 24000)
 	if err != nil {
 		t.Fatal(err)
 	}
+	turns, total := c.Turns, c.Total
 	if total != 3 || len(turns) != 3 {
 		t.Fatalf("want 3 lines and 3 turns, got %d lines, %+v", total, turns)
 	}
@@ -91,7 +104,7 @@ func TestReadDeltaAgentkitFormat(t *testing.T) {
 // C5: what the assistant DID (files touched, commands run) is evidence for
 // reference memories. Tool calls become one-line summaries — a file path, a
 // Bash description — and never the command itself, which may carry secrets.
-func TestReadDeltaToolSummaries(t *testing.T) {
+func TestReadChunkToolSummaries(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "t.jsonl")
 	data := `{"type":"assistant","message":{"role":"assistant","content":[` +
 		`{"type":"text","text":"Fixing the guard."},` +
@@ -103,10 +116,11 @@ func TestReadDeltaToolSummaries(t *testing.T) {
 	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	turns, _, err := ReadDelta(p, 0, 24000)
+	c, err := ReadChunk(p, 0, 24000)
 	if err != nil {
 		t.Fatal(err)
 	}
+	turns := c.Turns
 	if len(turns) != 2 {
 		t.Fatalf("a tool-only assistant message is still a turn: got %d", len(turns))
 	}

@@ -183,3 +183,12 @@ func TestSaveLogNilSafe(t *testing.T) {
 		t.Fatal("nil saveLog must peek-all nil")
 	}
 }
+
+func TestSaveLogReportsADeferralAsSuch(t *testing.T) {
+	l := testLog()
+	l.Record(SaveReport{SessionID: "s1", At: 1000, Skipped: "deferred: 5-hour usage 90% is over extract_max_usage 85%"})
+	got := l.Drain("s1", -1)
+	if got.Status != "deferred" || got.Note != "deferred: 5-hour usage 90% is over extract_max_usage 85%" {
+		t.Fatalf("a deferral is not 'nothing to save': %+v", got)
+	}
+}

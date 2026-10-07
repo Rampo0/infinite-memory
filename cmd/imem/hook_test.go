@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func hookInput(cwd, prompt string) string {
@@ -155,5 +156,64 @@ func TestHookSubagentStartInjectsRulesAndProtocol(t *testing.T) {
 	fd.mu.Unlock()
 	if body["source"] != "subagent" || body["session_id"] != "parent" {
 		t.Fatalf("the daemon must learn it is a subagent of the parent session, got %v", body)
+	}
+}
+
+func stopInput(t *testing.T, transcript, reply string, active bool) string {
+	t.Helper()
+	b, _ := json.Marshal(map[string]any{
+		"session_id": "s1", "cwd": t.TempDir(), "transcript_path": transcript,
+		"last_assistant_message": reply, "stop_hook_active": active,
+	})
+	return string(b)
+}
+
+func transcriptWith(t *testing.T, lines ...string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "t.jsonl")
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+const promptLine = `{"type":"user","message":{"role":"user","content":"commit it"}}`
+const replyLine = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Committed as bddae456."}]}}`
+
+func TestHookStopWaitsForTheFinalReplyBeforeFlushing(t *testing.T) {
+	fd := newFakeDaemon(t)
+	p := transcriptWith(t, promptLine)
+	written := make(chan time.Time, 1)
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		f, _ := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
+		_, _ = f.WriteString(replyLine + "\n")
+		_ = f.Close()
+		written <- time.Now()
+	}()
+	runCLIStdin(t, addrOf(fd), stopInput(t, p, "Committed as bddae456.", false), "hook", "stop")
+	at := <-written
+	if fd.callCount("/v1/flush") != 1 || fd.calledAt("/v1/flush").Before(at) {
+		t.Fatal("the flush must read the transcript only after the final reply is written")
+	}
+}
+
+func TestHookStopDoesNotWaitWhenTheReplyIsWritten(t *testing.T) {
+	fd := newFakeDaemon(t)
+	p := transcriptWith(t, promptLine, replyLine)
+	start := time.Now()
+	runCLIStdin(t, addrOf(fd), stopInput(t, p, "Committed as bddae456.", false), "hook", "stop")
+	if time.Since(start) > 2*time.Second || fd.callCount("/v1/flush") != 1 {
+		t.Fatal("a reply already on disk must flush at once")
+	}
+}
+
+func TestHookStopContinuationStillSaves(t *testing.T) {
+	fd := newFakeDaemon(t)
+	p := transcriptWith(t, promptLine, replyLine)
+	runCLIStdin(t, addrOf(fd), stopInput(t, p, "Committed as bddae456.", true), "hook", "stop")
+	if fd.callCount("/v1/extract") != 1 || fd.callCount("/v1/flush") != 0 {
+		t.Fatalf("a continued stop must queue a save without blocking: extract=%d flush=%d",
+			fd.callCount("/v1/extract"), fd.callCount("/v1/flush"))
 	}
 }

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -41,7 +42,8 @@ type SavedPayload struct {
 	Batches int    `json:"batches"`
 	MS      int64  `json:"ms"`     // newest drained batch duration
 	Status  string `json:"status"` // "" | "running" | "skipped"
-	Error   string `json:"error"`  // newest failure, "" when fine
+	Note    string `json:"note"`
+	Error   string `json:"error"` // newest failure, "" when fine
 	DueInS  int    `json:"due_in_s"`
 }
 
@@ -133,7 +135,9 @@ func (l *saveLog) Drain(sid string, maxLines int) SavedPayload {
 		if r.Error != "" {
 			out.Error = r.Error
 		}
-		if r.Skipped != "" && out.Status == "" {
+		if strings.HasPrefix(r.Skipped, "deferred") {
+			out.Status, out.Note = "deferred", r.Skipped
+		} else if r.Skipped != "" && out.Status == "" {
 			out.Status = "skipped"
 		}
 		for _, m := range r.Memories {

@@ -29,15 +29,43 @@ func ReadTail(path string, maxBytes int64) ([]Turn, error) {
 		}
 	}
 	var turns []Turn
+	lp := newLineParser()
 	for {
 		line, err := r.ReadBytes('\n')
-		if t, ok := parseLine(line); ok {
+		if t, ok := lp.parse(line); ok {
 			turns = append(turns, t)
 		}
 		if err != nil {
 			return turns, nil
 		}
 	}
+}
+
+const finalReplyTail = 512 * 1024
+
+func HasFinalReply(path, reply string) bool {
+	want := squash(reply)
+	if want == "" {
+		return true
+	}
+	turns, err := ReadTail(path, finalReplyTail)
+	if err != nil {
+		return false
+	}
+	for i := len(turns) - 1; i >= 0; i-- {
+		if turns[i].Role == "assistant" && turns[i].Text != "" {
+			return samePrefix(squash(turns[i].Text), want, 200)
+		}
+	}
+	return false
+}
+
+func squash(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func samePrefix(a, b string, n int) bool {
+	return clipRunes(a, n) == clipRunes(b, n)
 }
 
 func LastExchange(turns []Turn, maxChars int) string {

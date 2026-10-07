@@ -28,6 +28,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Rampo0/infinite-memory/internal/graph"
 	"github.com/Rampo0/infinite-memory/internal/retrieve"
@@ -55,16 +56,19 @@ type fakeDaemon struct {
 	calls    map[string]int
 	lastBody map[string]any
 	bodies   map[string]map[string]any
+	at       map[string]time.Time
 }
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
 	t.Helper()
-	fd := &fakeDaemon{queries: map[string]url.Values{}, calls: map[string]int{}, bodies: map[string]map[string]any{}}
+	fd := &fakeDaemon{queries: map[string]url.Values{}, calls: map[string]int{}, bodies: map[string]map[string]any{},
+		at: map[string]time.Time{}}
 	mux := http.NewServeMux()
 	record := func(r *http.Request) {
 		fd.mu.Lock()
 		fd.queries[r.URL.Path] = r.URL.Query()
 		fd.calls[r.URL.Path]++
+		fd.at[r.URL.Path] = time.Now()
 		fd.mu.Unlock()
 	}
 	keepBody := func(r *http.Request) {
@@ -166,6 +170,12 @@ func (fd *fakeDaemon) callCount(path string) int {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	return fd.calls[path]
+}
+
+func (fd *fakeDaemon) calledAt(path string) time.Time {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	return fd.at[path]
 }
 
 func (fd *fakeDaemon) body(path string) map[string]any {

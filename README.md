@@ -176,10 +176,16 @@ every escaped statement.
   compaction): this project's rules — a parent workspace counts as this project — then
   its preferences, then other projects' rules and preferences, within `rules_max_chars`.
   Per prompt, rules still surface like any memory when their topic matches.
-- **Extraction**: the worker reads the transcript delta since the stored cursor — the
-  text of each turn plus one-line tool summaries (`Edit <path>`, `Bash: <description>`;
-  never a command, which may carry secrets) — and prompts `claude -p` (`extract_model`)
-  with `--json-schema`. Two more things go into the prompt for your own sessions:
+- **Extraction**: the worker reads the transcript from the stored cursor — the text of each
+  turn, the final report of every Agent/Task subagent, prompts typed while Claude was busy,
+  slash-command arguments, plus one-line tool summaries (`Edit <path>`, `Bash: <description>`;
+  never a command, which may carry secrets) — oldest first, up to `max_transcript_chars`, and
+  prompts `claude -p` (`extract_model`, `extract_effort`) with `--json-schema`. Messages over
+  6 KB (8 KB for agent reports) keep their head and tail. A longer delta is extracted in
+  chunks: the cursor stops after the last turn read and the rest is queued at once. Every
+  spawn is isolated (`--safe-mode --setting-sources "" --tools ""`): no CLAUDE.md, rules,
+  plugins or MCP servers, and no inherited effort. Two more things go into the prompt for
+  your own sessions:
   - **reconcile** — the 12 existing memories most like the excerpt; each new memory says
     `add`, `update` (it replaces that memory, which is superseded) or `noop` (that
     memory already says it; it is re-observed, `seen_count` grows);
@@ -189,9 +195,18 @@ every escaped statement.
     Retiring a memory still takes an `update` naming its replacement.
 
   Targets and grades are whitelisted to the ids the model was shown. By default the Stop
-  hook **blocks** on `/v1/flush` so it can print what the turn saved; a delta under 200
-  chars skips the spawn. Past `stop_flush_budget_ms` (default 90s) the daemon answers
-  `running` and its report prints at the next prompt.
+  hook first waits (up to 5s) until Claude Code has written the turn's final reply
+  (`last_assistant_message`) to the transcript, then **blocks** on `/v1/flush` so it can
+  print what the turn saved. A delta under 200 chars waits, cursor unmoved, for the next
+  turn; a session end or the sweep extracts it anyway. Past `stop_flush_budget_ms`
+  (default 90s) the daemon answers `running` and its report prints at the next prompt.
+- **Nothing is dropped**: a failed extraction keeps the cursor and retries a chunk half the
+  size; after 3 failures the session pauses (30 min, doubling up to 24h) and the hook says
+  so. Above `extract_max_usage` (default 0.85 of the 5-hour window, probed every 10 min)
+  extraction is deferred, not skipped. Every 10 minutes the daemon **sweeps** sessions seen
+  in the last 7 days whose transcript has lines past the cursor and has been idle for 3
+  minutes, and extracts them — a missed Stop, a daemon restart or a session that never
+  sent SessionEnd still gets saved.
 - **Agent transcripts**: a transcript outside `~/.claude/projects` is only accepted from
   a configured `agent_roots` directory (symlinks resolved), is extracted in isolated mode
   (no MCP servers, settings or tools), never saves a `rule` or `preference` (those become
@@ -418,6 +433,8 @@ optional. Retrieval knobs:
 
 | key | default | meaning |
 |---|---|---|
+| `extract_effort` | high | `--effort` of every extraction spawn |
+| `extract_max_usage` | 0.85 | defer extraction above this share of the 5-hour window (-1 = never) |
 | `retrieve_k` | 6 | max memories per prompt before the char budget |
 | `retrieve_max_chars` | 6000 | per-prompt block budget (Claude Code inlines ≤10,000) |
 | `min_match` | 2.0 | relevance floor on the hook path (0 disables) |

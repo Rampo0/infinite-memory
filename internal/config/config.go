@@ -11,12 +11,14 @@ import (
 )
 
 type Config struct {
-	HTTPAddr     string `json:"http_addr"`
-	MemgraphURI  string `json:"memgraph_uri"`
-	MemgraphUser string `json:"memgraph_user"`
-	MemgraphPass string `json:"memgraph_pass"`
-	ClaudeBin    string `json:"claude_bin"`
-	ExtractModel string `json:"extract_model"`
+	HTTPAddr        string  `json:"http_addr"`
+	MemgraphURI     string  `json:"memgraph_uri"`
+	MemgraphUser    string  `json:"memgraph_user"`
+	MemgraphPass    string  `json:"memgraph_pass"`
+	ClaudeBin       string  `json:"claude_bin"`
+	ExtractModel    string  `json:"extract_model"`
+	ExtractEffort   string  `json:"extract_effort"`
+	ExtractMaxUsage float64 `json:"extract_max_usage"`
 	// ExpandEnabled turns on the LLM query expander on the retrieval path.
 	// Note the polarity: every other bool here defaults true and relies on
 	// "explicit false wins". This one defaults false and relies on "explicit
@@ -121,6 +123,8 @@ func Default() Config {
 		MemgraphURI:              "bolt://127.0.0.1:7687",
 		ClaudeBin:                "claude",
 		ExtractModel:             "claude-haiku-4-5-20251001",
+		ExtractEffort:            "high",
+		ExtractMaxUsage:          0.85,
 		ExpandEnabled:            false,
 		ExpandModel:              "claude-haiku-4-5-20251001",
 		ExpandBudgetMS:           30000,
@@ -231,7 +235,17 @@ func Load() Config {
 	if cfg.ConsolidateMinJaccard <= 0 || cfg.ConsolidateMinJaccard > 1 {
 		cfg.ConsolidateMinJaccard = Default().ConsolidateMinJaccard
 	}
+	normExtract(&cfg)
 	return cfg
+}
+
+func normExtract(cfg *Config) {
+	if strings.TrimSpace(cfg.ExtractEffort) == "" {
+		cfg.ExtractEffort = Default().ExtractEffort
+	}
+	if cfg.ExtractMaxUsage == 0 {
+		cfg.ExtractMaxUsage = Default().ExtractMaxUsage
+	}
 }
 
 // Ignored reports whether cwd is, or lies under, an ignore_cwds root.

@@ -34,50 +34,34 @@ func fakeClaude(t *testing.T) (*Runner, func() []string) {
 	}
 }
 
-// An isolated extraction strips MCP servers, settings and tools from the
-// spawn, and its plain-"result" answer still parses into memories.
-func TestRunIsolatedExtraction(t *testing.T) {
+func TestRunExtractionIsIsolatedWithPinnedEffort(t *testing.T) {
 	r, args := fakeClaude(t)
-	raw, err := r.Run(context.Background(), "transcript", true)
+	r.Effort = "high"
+	raw, err := r.Run(context.Background(), "transcript")
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := args()
 	for _, want := range []string{"--safe-mode", "--strict-mcp-config", "--setting-sources", "--tools", "--json-schema"} {
 		if !slices.Contains(got, want) {
-			t.Fatalf("isolated spawn missing %s: %q", want, got)
+			t.Fatalf("extraction spawn missing %s: %q", want, got)
 		}
 	}
 	if slices.Contains(got, "--allowedTools") {
-		t.Fatalf("isolated spawn still allows a tool: %q", got)
+		t.Fatalf("extraction spawn still allows a tool: %q", got)
 	}
-	// An empty value is what strips them; a stray value would load some back.
 	for _, flag := range []string{"--tools", "--setting-sources"} {
 		i := slices.Index(got, flag)
 		if i < 0 || i+1 >= len(got) || got[i+1] != "" {
 			t.Fatalf("%s must be followed by an empty value: %q", flag, got)
 		}
 	}
+	if i := slices.Index(got, "--effort"); i < 0 || i+1 >= len(got) || got[i+1] != "high" {
+		t.Fatalf("extraction must pin its effort instead of inheriting the user's: %q", got)
+	}
 	mems, err := ParseMemories(raw)
 	if err != nil || len(mems) != 1 || mems[0].Kind != "rule" {
 		t.Fatalf("ParseMemories(%q) = %v, %v", raw, mems, err)
-	}
-}
-
-// The user's own transcripts keep the interactive shape.
-func TestRunInteractiveExtraction(t *testing.T) {
-	r, args := fakeClaude(t)
-	if _, err := r.Run(context.Background(), "transcript", false); err != nil {
-		t.Fatal(err)
-	}
-	got := args()
-	if slices.Contains(got, "--safe-mode") || !slices.Contains(got, "--allowedTools") {
-		t.Fatalf("interactive spawn changed shape: %q", got)
-	}
-	// No MCP servers: the user-scope imem server (and every other one) would
-	// otherwise boot inside each extraction spawn for nothing.
-	if !slices.Contains(got, "--strict-mcp-config") {
-		t.Fatalf("interactive extraction must not load MCP servers: %q", got)
 	}
 }
 

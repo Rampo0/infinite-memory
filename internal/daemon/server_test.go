@@ -421,3 +421,30 @@ func TestWriteFileAtomicReplacesWholeFile(t *testing.T) {
 		t.Fatalf("temp files left behind: %v", entries)
 	}
 }
+
+func TestExtractSessionEndIsAFinalJob(t *testing.T) {
+	root := t.TempDir()
+	path := agentkitTranscript(t, root, "end.jsonl")
+	rec := &jobRecorder{}
+	s := extractServer(t, []string{root}, rec)
+	postExtract(s, map[string]any{"session_id": "e1", "transcript_path": path, "cwd": "/c", "source": "session_end"})
+	if jobs := rec.waitFor(t, 1); !jobs[0].Final {
+		t.Fatalf("a session end must extract even a short closing exchange, got %+v", jobs[0])
+	}
+}
+
+func TestExtractRemembersWhereTheTranscriptLives(t *testing.T) {
+	root := t.TempDir()
+	path := agentkitTranscript(t, root, "bot.jsonl")
+	rec := &jobRecorder{}
+	s := extractServer(t, []string{root}, rec)
+	var touched []graph.SessionSource
+	s.touch = func(_ context.Context, src graph.SessionSource, _ int64) error {
+		touched = append(touched, src)
+		return nil
+	}
+	postExtract(s, map[string]any{"session_id": "b1", "transcript_path": path, "cwd": "/c", "source": "session_end", "agent": true})
+	if len(touched) != 1 || touched[0].TranscriptPath != path || !touched[0].Agent || touched[0].ID != "b1" {
+		t.Fatalf("the sweep needs the transcript path and agent flag, got %+v", touched)
+	}
+}

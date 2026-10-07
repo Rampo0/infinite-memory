@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode/utf8"
 )
 
 type Turn struct {
@@ -28,6 +29,7 @@ type envelope struct {
 	IsMeta            bool            `json:"isMeta"`
 	IsAPIErrorMessage bool            `json:"isApiErrorMessage"`
 	Message           json.RawMessage `json:"message"`
+	Attachment        json.RawMessage `json:"attachment"`
 }
 
 type message struct {
@@ -36,64 +38,98 @@ type message struct {
 }
 
 type contentBlock struct {
-	Type  string          `json:"type"`
-	Text  string          `json:"text"`
-	Name  string          `json:"name"`
-	Input json.RawMessage `json:"input"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Name      string          `json:"name"`
+	ID        string          `json:"id"`
+	ToolUseID string          `json:"tool_use_id"`
+	Input     json.RawMessage `json:"input"`
+	Content   json.RawMessage `json:"content"`
 }
 
 const maxToolsPerTurn = 8
 
-const perMessageClip = 2000
+const (
+	messageClip = 6000
+	reportClip  = 8000
+)
 
-// ReadDelta parses transcript lines [fromLine, EOF) into conversational
-// turns and reports the file's total line count (the next cursor value).
-// Non-message line types, sidechains, meta lines and tool plumbing are
-// skipped. Turns are clipped per message, then trimmed from the OLDEST side
-// until the total fits maxChars, so the newest turns always survive.
-func ReadDelta(path string, fromLine, maxChars int) (turns []Turn, totalLines int, err error) {
+type Chunk struct {
+	Turns []Turn
+	Next  int
+	Total int
+}
+
+type lineTurn struct {
+	turn Turn
+	line int
+}
+
+func ReadChunk(path string, fromLine, maxChars int) (Chunk, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, 0, err
+		return Chunk{}, err
 	}
 	defer f.Close()
+	lts, total, err := readTurns(bufio.NewReaderSize(f, 256*1024), fromLine)
+	if err != nil {
+		return Chunk{}, err
+	}
+	return budgetChunk(lts, total, maxChars), nil
+}
 
-	r := bufio.NewReaderSize(f, 256*1024)
+func readTurns(r *bufio.Reader, fromLine int) ([]lineTurn, int, error) {
+	p := newLineParser()
+	var out []lineTurn
+	total := 0
 	for {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 {
-			if totalLines >= fromLine {
-				if t, ok := parseLine(line); ok {
-					turns = append(turns, t)
+			if total >= fromLine {
+				if t, ok := p.parse(line); ok {
+					out = append(out, lineTurn{turn: t, line: total})
 				}
 			}
-			totalLines++
+			total++
 		}
 		if err == io.EOF {
-			break
+			return out, total, nil
 		}
 		if err != nil {
 			return nil, 0, err
 		}
 	}
-
-	// Budget: keep newest turns.
-	total := 0
-	cut := len(turns)
-	for i := len(turns) - 1; i >= 0; i-- {
-		total += len(turns[i].Text) + len(strings.Join(turns[i].Tools, "; "))
-		if maxChars > 0 && total > maxChars {
-			break
-		}
-		cut = i
-	}
-	return turns[cut:], totalLines, nil
 }
 
-func parseLine(line []byte) (Turn, bool) {
+func budgetChunk(lts []lineTurn, total, maxChars int) Chunk {
+	c := Chunk{Next: total, Total: total}
+	size := 0
+	for i, lt := range lts {
+		size += len(lt.turn.Text) + len(strings.Join(lt.turn.Tools, "; "))
+		if maxChars > 0 && size > maxChars && i > 0 {
+			c.Next = lt.line
+			return c
+		}
+		c.Turns = append(c.Turns, lt.turn)
+	}
+	return c
+}
+
+type lineParser struct {
+	agentCalls map[string]bool
+}
+
+func newLineParser() *lineParser {
+	return &lineParser{agentCalls: map[string]bool{}}
+}
+
+func (p *lineParser) parse(line []byte) (Turn, bool) {
 	var env envelope
 	if err := json.Unmarshal(line, &env); err != nil {
 		return Turn{}, false
+	}
+	if env.Type == "attachment" && !env.IsSidechain {
+		return queuedPrompt(env.Attachment)
 	}
 	if env.Type != "user" && env.Type != "assistant" {
 		return Turn{}, false
@@ -105,20 +141,117 @@ func parseLine(line []byte) (Turn, bool) {
 	if err := json.Unmarshal(env.Message, &msg); err != nil {
 		return Turn{}, false
 	}
-
-	text := extractText(msg.Content)
-	text = strings.TrimSpace(text)
-	var tools []string
 	if env.Type == "assistant" {
-		tools = toolSummaries(msg.Content)
+		p.noteAgentCalls(msg.Content)
+	} else if t, ok := p.subagentReport(msg.Content); ok {
+		return t, true
 	}
-	if (text == "" && len(tools) == 0) || isPlumbing(text) {
+	return conversationTurn(env.Type, msg.Content)
+}
+
+func conversationTurn(role string, content json.RawMessage) (Turn, bool) {
+	text := strings.TrimSpace(extractText(content))
+	if isPlumbing(text) {
+		text = slashCommand(text)
+	}
+	var tools []string
+	if role == "assistant" {
+		tools = toolSummaries(content)
+	}
+	if text == "" && len(tools) == 0 {
 		return Turn{}, false
 	}
-	if len(text) > perMessageClip {
-		text = text[:perMessageClip]
+	return Turn{Role: role, Text: clipMessage(text), Tools: tools}, true
+}
+
+func (p *lineParser) noteAgentCalls(raw json.RawMessage) {
+	var blocks []contentBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return
 	}
-	return Turn{Role: env.Type, Text: text, Tools: tools}, true
+	for _, b := range blocks {
+		if b.Type == "tool_use" && (b.Name == "Agent" || b.Name == "Task") && b.ID != "" {
+			p.agentCalls[b.ID] = true
+		}
+	}
+}
+
+func (p *lineParser) subagentReport(raw json.RawMessage) (Turn, bool) {
+	var blocks []contentBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return Turn{}, false
+	}
+	var parts []string
+	for _, b := range blocks {
+		if b.Type != "tool_result" || !p.agentCalls[b.ToolUseID] {
+			continue
+		}
+		text := strings.TrimSpace(extractText(b.Content))
+		if text != "" && !strings.HasPrefix(text, "Async agent launched") {
+			parts = append(parts, text)
+		}
+	}
+	if len(parts) == 0 {
+		return Turn{}, false
+	}
+	return Turn{Role: "assistant", Text: clipMessage("Subagent report: " + strings.Join(parts, "\n\n"))}, true
+}
+
+func queuedPrompt(raw json.RawMessage) (Turn, bool) {
+	var a struct {
+		Type   string          `json:"type"`
+		Prompt json.RawMessage `json:"prompt"`
+	}
+	if json.Unmarshal(raw, &a) != nil || a.Type != "queued_command" {
+		return Turn{}, false
+	}
+	text := strings.TrimSpace(extractText(a.Prompt))
+	if text == "" || isPlumbing(text) {
+		return Turn{}, false
+	}
+	return Turn{Role: "user", Text: clipMessage(text)}, true
+}
+
+func slashCommand(text string) string {
+	args := strings.TrimSpace(between(text, "<command-args>", "</command-args>"))
+	name := strings.TrimSpace(between(text, "<command-name>", "</command-name>"))
+	if args == "" || name == "" {
+		return ""
+	}
+	return name + " " + args
+}
+
+func between(s, open, closing string) string {
+	i := strings.Index(s, open)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(open):]
+	j := strings.Index(rest, closing)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+func clipMessage(text string) string {
+	limit := messageClip
+	if strings.HasPrefix(text, "<task-notification>") || strings.HasPrefix(text, "Subagent report: ") {
+		limit = reportClip
+	}
+	return clipMiddle(text, limit)
+}
+
+func clipMiddle(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	head := clipRunes(s, n*2/3)
+	tail := len(s) - (n - len(head))
+	for tail < len(s) && !utf8.RuneStart(s[tail]) {
+		tail++
+	}
+	return head + "\n…\n" + s[tail:]
 }
 
 // toolSummaries renders tool_use blocks as one safe line each. Only fields
