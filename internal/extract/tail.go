@@ -2,6 +2,7 @@ package extract
 
 import (
 	"bufio"
+	"encoding/json"
 	"io"
 	"os"
 	"strings"
@@ -9,6 +10,21 @@ import (
 )
 
 func ReadTail(path string, maxBytes int64) ([]Turn, error) {
+	lines, err := tailLines(path, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	var turns []Turn
+	lp := newLineParser()
+	for _, line := range lines {
+		if t, ok := lp.parse(line); ok {
+			turns = append(turns, t)
+		}
+	}
+	return turns, nil
+}
+
+func tailLines(path string, maxBytes int64) ([][]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -28,15 +44,14 @@ func ReadTail(path string, maxBytes int64) ([]Turn, error) {
 			return nil, nil
 		}
 	}
-	var turns []Turn
-	lp := newLineParser()
+	var lines [][]byte
 	for {
 		line, err := r.ReadBytes('\n')
-		if t, ok := lp.parse(line); ok {
-			turns = append(turns, t)
+		if len(line) > 0 {
+			lines = append(lines, line)
 		}
 		if err != nil {
-			return turns, nil
+			return lines, nil
 		}
 	}
 }
@@ -91,4 +106,58 @@ func clipRunes(s string, n int) string {
 		cut--
 	}
 	return s[:cut]
+}
+
+const searchTool = "mcp__imem__imem_search"
+
+func LastTurnSearch(path string) (string, bool) {
+	lines, err := tailLines(path, finalReplyTail)
+	if err != nil {
+		return "", false
+	}
+	id, searched := "", false
+	for _, line := range lines {
+		var env envelope
+		if json.Unmarshal(line, &env) != nil || env.IsSidechain || env.IsMeta || len(env.Message) == 0 {
+			continue
+		}
+		var msg message
+		if json.Unmarshal(env.Message, &msg) != nil {
+			continue
+		}
+		switch {
+		case env.Type == "user" && isRealPrompt(msg.Content):
+			id, searched = env.UUID, false
+		case env.Type == "assistant" && callsTool(msg.Content, searchTool):
+			searched = true
+		}
+	}
+	return id, searched
+}
+
+func isRealPrompt(raw json.RawMessage) bool {
+	var blocks []contentBlock
+	if json.Unmarshal(raw, &blocks) == nil {
+		for _, b := range blocks {
+			if b.Type == "tool_result" {
+				return false
+			}
+		}
+	}
+	text := strings.TrimSpace(extractText(raw))
+	return text != "" && !strings.HasPrefix(text, "<task-notification") && !strings.HasPrefix(text, "<local-command") &&
+		!strings.HasPrefix(text, "Caveat:")
+}
+
+func callsTool(raw json.RawMessage, name string) bool {
+	var blocks []contentBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return false
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_use" && b.Name == name {
+			return true
+		}
+	}
+	return false
 }

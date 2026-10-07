@@ -15,7 +15,7 @@ func TestMCPSearchThroughDaemon(t *testing.T) {
 	fd := newFakeDaemon(t)
 	in := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}` + "\n" +
 		`{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n" +
-		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"imem_search","arguments":{"query":"jago whitelist","limit":3}}}` + "\n"
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"imem_search","arguments":{"query":"jago whitelist","limit":3,"offset":6}}}` + "\n"
 	out, code := runCLIStdin(t, addrOf(fd), in, "mcp")
 	if code != 0 {
 		t.Fatalf("exit %d", code)
@@ -38,7 +38,7 @@ func TestMCPSearchThroughDaemon(t *testing.T) {
 		t.Fatalf("search text must carry kind, title and content:\n%s", text)
 	}
 	q := fd.query("/v1/memories")
-	if q.Get("q") != "jago whitelist" || q.Get("limit") != "3" || q.Get("cwd") == "" {
+	if q.Get("q") != "jago whitelist" || q.Get("limit") != "3" || q.Get("offset") != "6" || q.Get("cwd") == "" {
 		t.Fatalf("query must reach the daemon with limit and cwd, got %v", q)
 	}
 }

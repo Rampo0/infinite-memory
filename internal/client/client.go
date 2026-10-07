@@ -118,15 +118,32 @@ type SessionStartRequest struct {
 }
 
 type SessionStartResponse struct {
-	Context     string `json:"context"`
-	Rules       int    `json:"rules"`
-	Preferences int    `json:"preferences"`
-	Omitted     int    `json:"omitted"`
-	RulesFile   int    `json:"rules_file"`
+	Context         string `json:"context"`
+	Rules           int    `json:"rules"`
+	Preferences     int    `json:"preferences"`
+	Omitted         int    `json:"omitted"`
+	RulesFile       int    `json:"rules_file"`
+	PreferencesFile int    `json:"preferences_file"`
 }
 
 func SessionStart(baseURL string, req SessionStartRequest, timeout time.Duration) (SessionStartResponse, error) {
 	var out SessionStartResponse
 	err := post(baseURL, "/v1/session-start", req, timeout, &out)
+	return out, err
+}
+
+type GateRequest struct {
+	SessionID string `json:"session_id"`
+	PromptID  string `json:"prompt_id"`
+	Searched  bool   `json:"searched"`
+}
+
+type GateResponse struct {
+	Fire bool `json:"fire"`
+}
+
+func Gate(baseURL string, req GateRequest, timeout time.Duration) (GateResponse, error) {
+	var out GateResponse
+	err := post(baseURL, "/v1/gate", req, timeout, &out)
 	return out, err
 }

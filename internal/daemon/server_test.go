@@ -389,18 +389,23 @@ func TestExtractCarriesTheHeadlessFlag(t *testing.T) {
 	}
 }
 
-func TestSessionStartWritesEveryRuleToTheRulesFileAndKeepsPreferences(t *testing.T) {
+func TestSessionStartWritesEveryRuleAndPreferenceToTheRulesFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "imem-rules.md")
 	s := rulesServer(t, config.Config{RulesOnSessionStart: true, RulesMaxChars: 8000, MaxMemoryContentChars: 400, RulesFile: path})
-	block, _ := sessionStart(s, "s1", "startup")["context"].(string)
-	if strings.Contains(block, "[rule]") || !strings.Contains(block, "- [preference] Prefers stdlib") {
-		t.Fatalf("with a rules file the block carries preferences only:\n%s", block)
+	out := sessionStart(s, "s1", "startup")
+	block, _ := out["context"].(string)
+	if strings.Contains(block, "[rule]") || strings.Contains(block, "[preference]") {
+		t.Fatalf("with a rules file nothing unpinned rides in the capped block:\n%s", block)
+	}
+	if out["rules_file"] != float64(2) || out["preferences_file"] != float64(1) {
+		t.Fatalf("the response must count what the file holds: %v", out)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"- [rule] Local rule — Functions under 60 lines. (from here)", "- [rule] Foreign rule — x (from other)"} {
+	for _, want := range []string{"- [rule] Local rule — Functions under 60 lines. (from here)", "- [rule] Foreign rule — x (from other)",
+		"- [preference] Prefers stdlib — No frameworks. (from here)"} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("rules file misses %q:\n%s", want, data)
 		}
@@ -446,5 +451,15 @@ func TestExtractRemembersWhereTheTranscriptLives(t *testing.T) {
 	postExtract(s, map[string]any{"session_id": "b1", "transcript_path": path, "cwd": "/c", "source": "session_end", "agent": true})
 	if len(touched) != 1 || touched[0].TranscriptPath != path || !touched[0].Agent || touched[0].ID != "b1" {
 		t.Fatalf("the sweep needs the transcript path and agent flag, got %+v", touched)
+	}
+}
+
+func TestSessionStartBlockKeepsPinnedItemsWithARulesFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "imem-rules.md")
+	s := rulesServer(t, config.Config{RulesOnSessionStart: true, RulesMaxChars: 8000, MaxMemoryContentChars: 400, RulesFile: path})
+	pinFirstRule(s)
+	block, _ := sessionStart(s, "s1", "startup")["context"].(string)
+	if !strings.Contains(block, "- [rule] Foreign rule") || strings.Contains(block, "Local rule") {
+		t.Fatalf("pinned items lead every session, the rest live in the file:\n%s", block)
 	}
 }

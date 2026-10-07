@@ -40,6 +40,7 @@ type server struct {
 	corpus   *corpusCache
 	// injections tracks what each session was already shown.
 	injections *injectionLog
+	gates      *gateLog
 	// byKind fetches every live memory of one kind (func field so handlers
 	// test without Memgraph, the same injection shape as Expander.Run).
 	byKind func(ctx context.Context, kind string) ([]graph.Candidate, error)
@@ -61,19 +62,42 @@ type server struct {
 // Run starts the daemon in the foreground. The port bind doubles as the
 // singleton lock: a second instance fails to bind and exits.
 func Run(cfg config.Config) error {
+	log := openLog(cfg)
+	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
+	if err != nil {
+		return err
+	}
+	s := newServer(cfg, store, log)
+	worker := s.newWorker()
+	s.expander = s.newExpander(worker.Runner)
+	s.queue = NewQueue(cfg.Debounce(), worker.Process, log)
+	worker.Requeue = s.queue.enqueue
+	s.queue.OnPending = s.saves.MarkPending
+	s.queue.Start()
+	s.startLoops(worker.Runner)
+	// Memgraph may be down at startup: log and keep serving, the schema is
+	// re-attempted on the next successful health check.
+	s.ensureSchema(context.Background())
+	go s.refreshRulesFile()
+	ln, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("bind %s failed (daemon already running?): %w", cfg.HTTPAddr, err)
+	}
+	log.Info("imem daemon listening", "addr", cfg.HTTPAddr, "memgraph", cfg.MemgraphURI)
+	return http.Serve(ln, s.routes())
+}
+
+func openLog(cfg config.Config) *slog.Logger {
 	logPath := cfg.LogPath()
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	var w io.Writer = os.Stderr
 	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 		w = io.MultiWriter(os.Stderr, f)
 	}
-	log := slog.New(slog.NewTextHandler(w, nil))
+	return slog.New(slog.NewTextHandler(w, nil))
+}
 
-	store, err := graph.New(cfg.MemgraphURI, cfg.MemgraphUser, cfg.MemgraphPass)
-	if err != nil {
-		return err
-	}
-
+func newServer(cfg config.Config, store *graph.Store, log *slog.Logger) *server {
 	corpus := newCorpusCache(store.CountLive)
 	s := &server{
 		cfg:   cfg,
@@ -86,25 +110,30 @@ func Run(cfg config.Config) error {
 			MaxChars: cfg.RetrieveMaxChars,
 		},
 		corpus:     corpus,
-		injections: newInjectionLog(),
+		injections: loadInjectionLog(cfg),
+		gates:      newGateLog(),
 		byKind: func(ctx context.Context, kind string) ([]graph.Candidate, error) {
 			return store.ByKind(ctx, kind, -1)
 		},
 		saveBatch: store.SaveBatch,
 		touch:     store.TouchSession,
+		saves:     newSaveLog(),
+		vocab:     newVocabCache(),
 		log:       log,
 	}
 	if cfg.RulesOnSessionStart {
 		// Standing rules arrive once per session; per prompt only matches.
 		s.retr.RulesK = 0
 	}
-	s.saves = newSaveLog()
-	s.vocab = newVocabCache()
-	worker := NewWorker(store, cfg, log)
+	return s
+}
+
+func (s *server) newWorker() *Worker {
+	worker := NewWorker(s.store, s.cfg, s.log)
 	worker.Saves = s.saves
 	// B1: the extractor sees the 12 existing memories most like the excerpt.
-	similar := retrieve.Retriever{Store: store, K: 12, Corpus: corpus.Get,
-		MinMatch: cfg.MinMatch, RelatedMinWeight: cfg.RelatedMinWeight}
+	similar := retrieve.Retriever{Store: s.store, K: 12, Corpus: s.corpus.Get,
+		MinMatch: s.cfg.MinMatch, RelatedMinWeight: s.cfg.RelatedMinWeight}
 	worker.Similar = func(ctx context.Context, pk string, tokens []string) ([]extract.Known, error) {
 		scored, err := similar.QueryTokens(ctx, pk, tokens, time.Now().Unix())
 		out := make([]extract.Known, len(scored))
@@ -121,25 +150,20 @@ func Run(cfg config.Config) error {
 		}
 		return out
 	}
-	s.expander = s.newExpander(worker.Runner)
-	s.queue = NewQueue(cfg.Debounce(), worker.Process, log)
-	worker.Requeue = s.queue.enqueue
-	s.queue.OnPending = s.saves.MarkPending
-	s.queue.Start()
+	return worker
+}
 
+func (s *server) startLoops(runner *extract.Runner) {
 	s.startSweepLoop()
-	if cfg.BackupEnabled {
+	if s.cfg.BackupEnabled {
 		s.startBackupLoop()
 	}
-	if cfg.ConsolidateEnabled {
-		s.startConsolidateLoop(worker.Runner)
+	if s.cfg.ConsolidateEnabled {
+		s.startConsolidateLoop(runner)
 	}
+}
 
-	// Memgraph may be down at startup: log and keep serving, the schema is
-	// re-attempted on the next successful health check.
-	s.ensureSchema(context.Background())
-	go s.refreshRulesFile()
-
+func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("POST /v1/retrieve", s.handleRetrieve)
@@ -155,15 +179,11 @@ func Run(cfg config.Config) error {
 	mux.HandleFunc("GET /v1/stats", s.handleStats)
 	mux.HandleFunc("GET /v1/saved", s.handleSaved)
 	mux.HandleFunc("POST /v1/flush", s.handleFlush)
+	mux.HandleFunc("POST /v1/gate", s.handleGate)
+	mux.HandleFunc("GET /v1/gate", s.handleGateStats)
 	mux.HandleFunc("POST /v1/backup", s.handleBackup)
 	mux.HandleFunc("GET /v1/backups", s.handleBackups)
-
-	ln, err := net.Listen("tcp", cfg.HTTPAddr)
-	if err != nil {
-		return fmt.Errorf("bind %s failed (daemon already running?): %w", cfg.HTTPAddr, err)
-	}
-	log.Info("imem daemon listening", "addr", cfg.HTTPAddr, "memgraph", cfg.MemgraphURI)
-	return http.Serve(ln, mux)
+	return mux
 }
 
 func (s *server) ensureSchema(ctx context.Context) {
@@ -337,43 +357,45 @@ func (s *server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, empty)
 		return
 	}
-	inFile := 0
-	if s.cfg.RulesFile != "" {
-		s.writeRulesFile(rules)
-		inFile, rules = len(rules), nil
-	}
 	prefs, err := s.byKind(ctx, "preference")
 	if err != nil {
 		s.log.Warn("session-start preferences failed", "err", err)
 	}
 	pk := project.ResolveKey(req.CWD)
+	out := s.standingBlock(pk, rules, prefs)
+	s.log.Info("session-start", "project", pk, "source", req.Source, "rules", out["rules"],
+		"preferences", out["preferences"], "omitted", out["omitted"], "chars", len(out["context"].(string)))
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *server) standingBlock(pk string, rules, prefs []graph.Candidate) map[string]any {
 	standing := retrieve.SessionRules(rules, prefs, pk)
-	if s.cfg.RulesK > 0 && len(standing) > s.cfg.RulesK {
+	out := map[string]any{"rules_file": 0, "preferences_file": 0}
+	if s.cfg.RulesFile != "" {
+		s.writeRulesFile(rules, prefs)
+		out["rules_file"], out["preferences_file"] = len(rules), len(prefs)
+		standing = pinnedOnly(standing)
+	} else if s.cfg.RulesK > 0 && len(standing) > s.cfg.RulesK {
 		standing = standing[:s.cfg.RulesK]
 	}
-	if len(standing) == 0 {
-		writeJSON(w, http.StatusOK, empty)
-		return
+	block, _, shown := "", []retrieve.Scored(nil), []graph.Candidate(nil)
+	if len(standing) > 0 {
+		block, _, shown = retrieve.BuildBlock(retrieve.BlockInput{PK: pk, Rules: standing,
+			MaxContentChars: s.cfg.MaxMemoryContentChars, MaxChars: s.cfg.RulesMaxChars, Now: time.Now().Unix()})
 	}
-	block, _, shown := retrieve.BuildBlock(pk, nil, standing, s.cfg.MaxMemoryContentChars, s.cfg.RulesMaxChars, time.Now().Unix())
-	nRules, nPrefs := 0, 0
+	nRules := 0
 	for _, c := range shown {
 		if c.Kind == "rule" {
 			nRules++
-		} else {
-			nPrefs++
 		}
 	}
-	s.log.Info("session-start", "project", pk, "source", req.Source, "rules", nRules,
-		"preferences", nPrefs, "omitted", len(standing)-len(shown), "chars", len(block))
-	writeJSON(w, http.StatusOK, map[string]any{
-		"context": block, "rules": nRules, "preferences": nPrefs, "omitted": len(standing) - len(shown),
-		"rules_file": inFile,
-	})
+	out["context"], out["rules"], out["preferences"] = block, nRules, len(shown)-nRules
+	out["omitted"] = len(standing) - len(shown)
+	return out
 }
 
-func (s *server) writeRulesFile(rules []graph.Candidate) {
-	text := retrieve.RulesFileText(rules)
+func (s *server) writeRulesFile(rules, prefs []graph.Candidate) {
+	text := retrieve.RulesFileText(rules, prefs)
 	if old, err := os.ReadFile(s.cfg.RulesFile); err == nil && string(old) == text {
 		return
 	}
@@ -381,7 +403,7 @@ func (s *server) writeRulesFile(rules []graph.Candidate) {
 		s.log.Warn("rules file not written", "path", s.cfg.RulesFile, "err", err)
 		return
 	}
-	s.log.Info("rules file written", "path", s.cfg.RulesFile, "rules", len(rules), "chars", len(text))
+	s.log.Info("rules file written", "path", s.cfg.RulesFile, "rules", len(rules), "preferences", len(prefs), "chars", len(text))
 }
 
 func writeFileAtomic(path, text string) error {
@@ -413,7 +435,12 @@ func (s *server) refreshRulesFile() {
 		s.log.Warn("rules file refresh failed", "err", err)
 		return
 	}
-	s.writeRulesFile(rules)
+	prefs, err := s.byKind(ctx, "preference")
+	if err != nil {
+		s.log.Warn("rules file refresh failed", "err", err)
+		return
+	}
+	s.writeRulesFile(rules, prefs)
 }
 
 // handleRules lists every live rule, this project's first, one line each in
@@ -525,6 +552,14 @@ func toInjected(mems []retrieve.Scored) []injected {
 	out := make([]injected, len(mems))
 	for i, m := range mems {
 		out[i] = injected{ID: m.ID, Title: m.Title, Content: m.Content, Kind: m.Kind}
+	}
+	return out
+}
+
+func toSearched(mems []retrieve.Scored, query string) []injected {
+	out := toInjected(mems)
+	for i := range out {
+		out[i].Via, out[i].Query = viaSearch, query
 	}
 	return out
 }
@@ -646,10 +681,12 @@ func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
 	qv := r.URL.Query()
 	pk := project.ResolveKey(qv.Get("cwd"))
 	prompt := qv.Get("q")
-	limit := s.cfg.RetrieveK
+	limit := defaultSearchLimit
 	if n, err := strconv.Atoi(qv.Get("limit")); err == nil && n > 0 && n <= 50 {
 		limit = n
 	}
+	offset, _ := strconv.Atoi(qv.Get("offset"))
+	offset = max(offset, 0)
 	// Budget must cover expansion too, or the CLI path times out in exactly
 	// the cases where the hook path succeeds.
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ExpandBudget()+2*time.Second)
@@ -659,7 +696,7 @@ func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
 	// `limit` (10 for the agents), and dropping weak matches would only cost
 	// the agents recall.
 	retr := &retrieve.Retriever{
-		Store: s.store, K: limit, MaxContentChars: s.cfg.MaxMemoryContentChars,
+		Store: s.store, K: offset + limit, MaxContentChars: s.cfg.MaxMemoryContentChars,
 		SameProjectBoost: s.cfg.SameProjectBoost, RulesK: 0,
 		Corpus: s.corpus.Get, RelatedMinWeight: s.cfg.RelatedMinWeight,
 	}
@@ -671,14 +708,21 @@ func (s *server) handleMemories(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	if scored == nil {
-		scored = []retrieve.Scored{}
-	}
+	scored = pageOf(scored, offset)
 	if sid := qv.Get("session_id"); sid != "" && len(scored) > 0 {
-		s.injections.Record(sid, toInjected(scored))
+		s.injections.Record(sid, toSearched(scored, prompt))
 		s.markInjected(scored)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"project": pk, "memories": scored})
+}
+
+const defaultSearchLimit = 10
+
+func pageOf(scored []retrieve.Scored, offset int) []retrieve.Scored {
+	if offset >= len(scored) {
+		return []retrieve.Scored{}
+	}
+	return scored[offset:]
 }
 
 // handleEntities lists entities globally, or scoped to one project when a

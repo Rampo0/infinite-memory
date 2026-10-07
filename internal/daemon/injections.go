@@ -1,8 +1,13 @@
 package daemon
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/Rampo0/infinite-memory/internal/config"
 )
 
 // injected is one memory a hook put into a session's context.
@@ -12,13 +17,19 @@ type injected struct {
 	Content string
 	Kind    string
 	At      int64
+	Via     string
+	Query   string
 }
+
+const viaSearch = "search"
 
 // injectionLog remembers, per session, which memories UserPromptSubmit has
 // already injected. Retrieve skips them (they are still in the model's
 // context), and the extractor is told which ones the assistant was shown.
 // In memory only: after a daemon restart a memory may be injected once more.
 type injectionLog struct {
+	path       string
+	timer      *time.Timer
 	mu         sync.Mutex
 	bySess     map[string]*sessInjections
 	maxPerSess int
@@ -67,6 +78,7 @@ func (l *injectionLog) Record(sid string, items []injected) {
 		ss.items = append([]injected(nil), ss.items[over:]...)
 	}
 	ss.last = now
+	l.schedule()
 }
 
 // Seen is the set of memory ids already injected into the session.
@@ -82,7 +94,9 @@ func (l *injectionLog) Seen(sid string) map[string]bool {
 	}
 	out := make(map[string]bool, len(ss.items))
 	for _, it := range ss.items {
-		out[it.ID] = true
+		if it.Via != viaSearch {
+			out[it.ID] = true
+		}
 	}
 	return out
 }
@@ -116,4 +130,60 @@ func (l *injectionLog) Reset(sid string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.bySess, sid)
+	l.schedule()
+}
+
+type savedSession struct {
+	Items []injected `json:"items"`
+	Last  int64      `json:"last"`
+}
+
+func (l *injectionLog) schedule() {
+	if l.path == "" || l.timer != nil {
+		return
+	}
+	l.timer = time.AfterFunc(2*time.Second, l.flush)
+}
+
+func (l *injectionLog) flush() {
+	l.mu.Lock()
+	l.timer = nil
+	out := make(map[string]savedSession, len(l.bySess))
+	for sid, ss := range l.bySess {
+		out[sid] = savedSession{Items: ss.items, Last: ss.last}
+	}
+	path := l.path
+	l.mu.Unlock()
+	if path == "" {
+		return
+	}
+	if data, err := json.Marshal(out); err == nil {
+		_ = writeFileAtomic(path, string(data))
+	}
+}
+
+func (l *injectionLog) load(path string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.path = path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var in map[string]savedSession
+	if json.Unmarshal(data, &in) != nil {
+		return
+	}
+	now := l.now()
+	for sid, ss := range in {
+		if now-ss.Last <= int64(l.ttl/time.Second) {
+			l.bySess[sid] = &sessInjections{items: ss.Items, last: ss.Last}
+		}
+	}
+}
+
+func loadInjectionLog(cfg config.Config) *injectionLog {
+	l := newInjectionLog()
+	l.load(filepath.Join(cfg.StateDir(), "injections.json"))
+	return l
 }

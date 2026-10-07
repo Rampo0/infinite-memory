@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Rampo0/infinite-memory/internal/aliases"
 	"github.com/Rampo0/infinite-memory/internal/backup"
@@ -162,9 +163,24 @@ func hookMain(args []string) {
 	}
 }
 
-const selfSearchProtocol = "<imem-protocol>Before answering, call imem_search (when the tool is available) at least once, " +
-	"with keywords you derive from the whole conversation: repo, service, feature and error names, identifiers, " +
-	"in English and Indonesian. The memories injected automatically only matched this prompt's literal words.</imem-protocol>"
+const selfSearchProtocol = "<imem-protocol>Before answering, call imem_search at least once with keywords you derive " +
+	"from the whole conversation: repo, service, feature and error names, identifiers, in English and Indonesian. " +
+	"The memories injected automatically only matched this prompt's literal words; use offset to page through more " +
+	"matches.</imem-protocol>"
+
+func commandPrompt(prompt string) string {
+	if !strings.HasPrefix(prompt, "/") {
+		return prompt
+	}
+	name, args := prompt, ""
+	if i := strings.IndexFunc(prompt, unicode.IsSpace); i > 0 {
+		name, args = prompt[:i], prompt[i:]
+	}
+	if strings.Contains(name[1:], "/") {
+		return prompt
+	}
+	return strings.TrimSpace(name[1:] + " " + strings.TrimSpace(args))
+}
 
 func withProtocol(block string) string {
 	if block == "" {
@@ -196,10 +212,9 @@ func recentContext(transcriptPath string) string {
 }
 
 func hookUserPrompt(cfg config.Config, in hookio.Input) {
-	prompt := strings.TrimSpace(in.PromptText())
-	// Slash commands and background-task notifications are not the user
-	// asking anything; neither is worth a retrieve.
-	if prompt == "" || strings.HasPrefix(prompt, "/") || strings.HasPrefix(prompt, "<task-notification") {
+	prompt := commandPrompt(strings.TrimSpace(in.PromptText()))
+	// Background-task notifications are not the user asking anything.
+	if prompt == "" || strings.HasPrefix(prompt, "<task-notification") {
 		return
 	}
 	start := time.Now()
@@ -261,17 +276,39 @@ func retrieveMessage(cfg config.Config, resp client.RetrieveResponse, err error,
 
 const finalReplyWait = 5 * time.Second
 
+const gateReason = "imem protocol: you answered without calling imem_search. Call it now with keywords you derive " +
+	"from the whole conversation (repo, service, feature and error names, identifiers; English and Indonesian), " +
+	"then correct or extend your answer if a memory changes it."
+
 func hookStop(cfg config.Config, in hookio.Input) {
 	req := client.ExtractRequest{
 		SessionID: in.SessionID, TranscriptPath: in.TranscriptPath, CWD: in.CWD, Source: "stop", Agent: headless(),
 	}
 	if in.StopHookActive {
+		if !req.Agent {
+			gateFires(cfg, in)
+		}
 		_, _ = client.NotifyExtract(cfg.BaseURL(), req, 500*time.Millisecond)
 		return
 	}
 	if !req.Agent {
 		waitForReply(in.TranscriptPath, in.LastAssistantMessage, finalReplyWait)
+		if gateFires(cfg, in) && cfg.EnforceSearch {
+			_ = hookio.EmitBlock(os.Stdout, gateReason, "imem: no imem_search this turn — asked Claude to search memory")
+			return
+		}
 	}
+	flushOnStop(cfg, req)
+}
+
+func gateFires(cfg config.Config, in hookio.Input) bool {
+	id, searched := extract.LastTurnSearch(in.TranscriptPath)
+	resp, err := client.Gate(cfg.BaseURL(), client.GateRequest{SessionID: in.SessionID, PromptID: id, Searched: searched},
+		500*time.Millisecond)
+	return err == nil && resp.Fire
+}
+
+func flushOnStop(cfg config.Config, req client.ExtractRequest) {
 	if cfg.HookFlushOnStop && !req.Agent {
 		// Blocking: force extraction now so the line describes THIS turn.
 		// The daemon caps its own wait at BudgetMS and answers "running"
@@ -313,7 +350,8 @@ func waitForReply(path, reply string, limit time.Duration) {
 func standingMessage(resp client.SessionStartResponse, ms int64) string {
 	msg := fmt.Sprintf("imem: %d standing rules, %d preferences (%dms)", resp.Rules, resp.Preferences, ms)
 	if resp.RulesFile > 0 {
-		msg = fmt.Sprintf("imem: %d rules in the rules file, %d preferences (%dms)", resp.RulesFile, resp.Preferences, ms)
+		msg = fmt.Sprintf("imem: %d rules + %d preferences in the rules file, %d pinned (%dms)",
+			resp.RulesFile, resp.PreferencesFile, resp.Rules+resp.Preferences, ms)
 	}
 	if resp.Omitted > 0 {
 		msg += fmt.Sprintf(" · %d more over budget", resp.Omitted)
@@ -648,8 +686,14 @@ func cmdStatus() {
 			fmt.Printf("  %s: %d memories, %d entities, %d sessions\n", p.Key, p.Memories, p.Entities, p.Sessions)
 		}
 	}
-	// Extraction health: the silent-failure case that is otherwise only
-	// visible by tailing the daemon log.
+	printExtraction(cfg)
+	printSelfSearch(cfg)
+	printBackups(cfg)
+}
+
+// Extraction health: the silent-failure case that is otherwise only
+// visible by tailing the daemon log.
+func printExtraction(cfg config.Config) {
 	var sv struct {
 		Sessions []struct {
 			SessionID  string `json:"session_id"`
@@ -662,45 +706,63 @@ func cmdStatus() {
 			Error   string `json:"error"`
 		} `json:"sessions"`
 	}
-	if err := getJSON(cfg.BaseURL()+"/v1/saved", &sv); err == nil {
-		if len(sv.Sessions) == 0 {
-			fmt.Println("extraction: no runs since the daemon started")
-		} else {
-			fmt.Printf("extraction: %d recent session(s)\n", len(sv.Sessions))
-			now := time.Now().Unix()
-			for _, r := range sv.Sessions {
-				sid := r.SessionID
-				if len(sid) > 8 {
-					sid = sid[:8]
-				}
-				switch {
-				case r.Error != "":
-					fmt.Printf("  %s  %-9s FAILED — %s\n", sid, ago(now, r.At), r.Error)
-				case len(r.Memories) > 0:
-					fmt.Printf("  %s  %-9s %d saved (%.1fs)\n", sid, ago(now, r.At), len(r.Memories), float64(r.DurationMS)/1000)
-				default:
-					fmt.Printf("  %s  %-9s nothing saved\n", sid, ago(now, r.At))
-				}
-			}
+	if err := getJSON(cfg.BaseURL()+"/v1/saved", &sv); err != nil {
+		return
+	}
+	if len(sv.Sessions) == 0 {
+		fmt.Println("extraction: no runs since the daemon started")
+		return
+	}
+	fmt.Printf("extraction: %d recent session(s)\n", len(sv.Sessions))
+	now := time.Now().Unix()
+	for _, r := range sv.Sessions {
+		sid := r.SessionID
+		if len(sid) > 8 {
+			sid = sid[:8]
+		}
+		switch {
+		case r.Error != "":
+			fmt.Printf("  %s  %-9s FAILED — %s\n", sid, ago(now, r.At), r.Error)
+		case len(r.Memories) > 0:
+			fmt.Printf("  %s  %-9s %d saved (%.1fs)\n", sid, ago(now, r.At), len(r.Memories), float64(r.DurationMS)/1000)
+		case strings.HasPrefix(r.Skipped, "deferred"):
+			fmt.Printf("  %s  %-9s %s\n", sid, ago(now, r.At), r.Skipped)
+		default:
+			fmt.Printf("  %s  %-9s nothing saved\n", sid, ago(now, r.At))
 		}
 	}
+}
+
+func printSelfSearch(cfg config.Config) {
+	var g struct {
+		Prompts  int `json:"prompts"`
+		Searched int `json:"searched"`
+		Fired    int `json:"fired"`
+	}
+	if err := getJSON(cfg.BaseURL()+"/v1/gate", &g); err == nil {
+		fmt.Printf("self-search: %d/%d prompts searched in the last 24h, gate fired %d\n", g.Searched, g.Prompts, g.Fired)
+	}
+}
+
+func printBackups(cfg config.Config) {
 	var bk struct {
 		IntervalHours int           `json:"interval_hours"`
 		Keep          int           `json:"keep"`
 		Backups       []backup.Info `json:"backups"`
 		LastError     string        `json:"last_error"`
 	}
-	if err := getJSON(cfg.BaseURL()+"/v1/backups", &bk); err == nil {
-		if len(bk.Backups) == 0 {
-			fmt.Printf("backups: none yet (every %dh, keep %d)\n", bk.IntervalHours, bk.Keep)
-		} else {
-			b := bk.Backups[0]
-			fmt.Printf("backups: %d kept, last %s (%s), every %dh\n",
-				len(bk.Backups), ago(time.Now().Unix(), b.ModTime.Unix()), humanBytes(b.Size), bk.IntervalHours)
-		}
-		if bk.LastError != "" {
-			fmt.Printf("  backup error: %s\n", bk.LastError)
-		}
+	if err := getJSON(cfg.BaseURL()+"/v1/backups", &bk); err != nil {
+		return
+	}
+	if len(bk.Backups) == 0 {
+		fmt.Printf("backups: none yet (every %dh, keep %d)\n", bk.IntervalHours, bk.Keep)
+	} else {
+		b := bk.Backups[0]
+		fmt.Printf("backups: %d kept, last %s (%s), every %dh\n",
+			len(bk.Backups), ago(time.Now().Unix(), b.ModTime.Unix()), humanBytes(b.Size), bk.IntervalHours)
+	}
+	if bk.LastError != "" {
+		fmt.Printf("  backup error: %s\n", bk.LastError)
 	}
 }
 
@@ -1215,9 +1277,12 @@ type mcpMemory struct {
 	LastSeen   int64  `json:"LastSeen"`
 }
 
-func mcpSearch(cfg config.Config, o mcpOpts) func(context.Context, string, int) (string, error) {
-	return func(ctx context.Context, query string, limit int) (string, error) {
+func mcpSearch(cfg config.Config, o mcpOpts) func(context.Context, string, int, int) (string, error) {
+	return func(ctx context.Context, query string, limit, offset int) (string, error) {
 		vals := url.Values{"cwd": {o.cwd}, "q": {query}, "limit": {strconv.Itoa(limit)}}
+		if offset > 0 {
+			vals.Set("offset", strconv.Itoa(offset))
+		}
 		if o.sessionID != "" {
 			vals.Set("session_id", o.sessionID)
 		}

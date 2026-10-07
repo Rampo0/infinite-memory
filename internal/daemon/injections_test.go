@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 )
 
@@ -74,5 +75,30 @@ func TestInjectionLogEmptySessionIsNoOp(t *testing.T) {
 	nilLog.Record("s", inj("a"))
 	if nilLog.Seen("s") != nil {
 		t.Fatal("a nil log is a no-op")
+	}
+}
+
+func TestSearchHitsDoNotHideMemoriesFromTheHook(t *testing.T) {
+	l := newInjectionLog()
+	l.Record("s1", inj("hooked"))
+	l.Record("s1", []injected{{ID: "searched", Kind: "fact", Via: viaSearch, Query: "jago whitelist"}})
+	if seen := l.Seen("s1"); !seen["hooked"] || seen["searched"] {
+		t.Fatalf("only hook injections dedupe the hook; a search may come from a subagent: %v", seen)
+	}
+	if got := l.Since("s1", 0); len(got) != 2 {
+		t.Fatalf("both still go to grading, got %d", len(got))
+	}
+}
+
+func TestInjectionLogSurvivesARestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "injections.json")
+	l := newInjectionLog()
+	l.path = path
+	l.Record("s1", inj("a"))
+	l.flush()
+	again := newInjectionLog()
+	again.load(path)
+	if !again.Seen("s1")["a"] {
+		t.Fatal("a daemon restart must not forget what the session was shown")
 	}
 }

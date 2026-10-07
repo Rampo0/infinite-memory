@@ -156,6 +156,18 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		w.WriteHeader(http.StatusAccepted)
 		reply(w, map[string]any{"queued": true})
 	})
+	mux.HandleFunc("POST /v1/gate", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fd.mu.Lock()
+		fd.bodies[r.URL.Path] = body
+		fd.mu.Unlock()
+		reply(w, map[string]any{"fire": body["searched"] != true && body["prompt_id"] != ""})
+	})
+	mux.HandleFunc("GET /v1/gate", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, map[string]any{"prompts": 4, "searched": 3, "fired": 1})
+	})
 	mux.HandleFunc("POST /v1/retrieve/preview", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, map[string]any{"context": "<infinite-memory project=\"/c\">\n" +
 			"Long-term memories from previous sessions (background knowledge; verify before relying on it):\n" +
@@ -206,6 +218,7 @@ func runCLIStdin(t *testing.T, addr, stdin string, args ...string) (string, int)
 type cliCall struct {
 	addr, stdin string
 	env         []string
+	extra       string
 }
 
 var interactiveEnv = []string{"CLAUDE_CODE_SESSION_ATTENDED=1", "CLAUDE_CODE_ENTRYPOINT=cli", "IMEM_AGENT=", "CLAUDE_CODE_SESSION_ID="}
@@ -213,7 +226,7 @@ var interactiveEnv = []string{"CLAUDE_CODE_SESSION_ATTENDED=1", "CLAUDE_CODE_ENT
 func runCLIWith(t *testing.T, c cliCall, args ...string) (string, int) {
 	t.Helper()
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`{"http_addr": %q}`, c.addr)), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(fmt.Sprintf(`{"http_addr": %q%s}`, c.addr, c.extra)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(os.Args[0], args...)
@@ -347,5 +360,12 @@ func TestContractRulesDown(t *testing.T) {
 	out, code := runCLI(t, "127.0.0.1:1", "rules")
 	if code == 0 || out != "" {
 		t.Fatalf("want non-zero exit and empty stdout, got code %d out %q", code, out)
+	}
+}
+
+func TestStatusShowsSelfSearchCompliance(t *testing.T) {
+	out, _ := runCLI(t, addrOf(newFakeDaemon(t)), "status")
+	if !strings.Contains(out, "self-search: 3/4 prompts searched in the last 24h, gate fired 1") {
+		t.Fatalf("status must show how often Claude searched on its own:\n%s", out)
 	}
 }

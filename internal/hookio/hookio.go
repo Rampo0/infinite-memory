@@ -61,3 +61,13 @@ func EmitContext(w io.Writer, event, context, systemMessage string) error {
 	}
 	return json.NewEncoder(w).Encode(out)
 }
+
+type blockOutput struct {
+	Decision      string `json:"decision"`
+	Reason        string `json:"reason"`
+	SystemMessage string `json:"systemMessage,omitempty"`
+}
+
+func EmitBlock(w io.Writer, reason, systemMessage string) error {
+	return json.NewEncoder(w).Encode(blockOutput{Decision: "block", Reason: reason, SystemMessage: systemMessage})
+}

@@ -132,3 +132,30 @@ func TestLastReplyMatches(t *testing.T) {
 		t.Fatal("no reply to wait for counts as present")
 	}
 }
+
+const searchCall = `{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[` +
+	`{"type":"tool_use","id":"t1","name":"mcp__imem__imem_search","input":{"query":"imem gate"}}]}}`
+
+func promptWith(uuid, text string) string {
+	return `{"type":"user","uuid":"` + uuid + `","message":{"role":"user","content":` + quote(text) + `}}`
+}
+
+func TestLastTurnSearchFindsTheLatestPrompt(t *testing.T) {
+	p := writeLines(t, promptWith("u1", "first"), searchCall, assistantLine("done"),
+		promptWith("u2", "second"), assistantLine("answered without searching"))
+	id, searched := LastTurnSearch(p)
+	if id != "u2" || searched {
+		t.Fatalf("the search belonged to the earlier prompt: id=%q searched=%v", id, searched)
+	}
+}
+
+func TestLastTurnSearchSeesASearchAfterThePrompt(t *testing.T) {
+	p := writeLines(t, promptWith("u1", "first"), assistantLine("ok"), promptWith("u2", "second"),
+		`{"type":"user","uuid":"r1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"ok"},`+
+			`{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`,
+		promptWith("n1", "<task-notification>\n<task-id>x</task-id>"), searchCall, assistantLine("answered"))
+	id, searched := LastTurnSearch(p)
+	if id != "u2" || !searched {
+		t.Fatalf("tool results and task notifications do not start a new prompt: id=%q searched=%v", id, searched)
+	}
+}

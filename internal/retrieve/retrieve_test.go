@@ -488,7 +488,7 @@ func manyMems(n, contentLen int, now int64) []Scored {
 func TestBuildBlockStaysUnderBudget(t *testing.T) {
 	now := int64(1_000_000)
 	mems := manyMems(30, 300, now)
-	block, shown, shownRules := BuildBlock("/p", mems, nil, 400, 3000, now)
+	block, shown, shownRules := BuildBlock(BlockInput{PK: "/p", Mems: mems, MaxContentChars: 400, MaxChars: 3000, Now: now})
 	if len(block) > 3000 {
 		t.Fatalf("block is %d chars, budget 3000", len(block))
 	}
@@ -500,7 +500,7 @@ func TestBuildBlockStaysUnderBudget(t *testing.T) {
 			t.Fatalf("shown must be the top-scored prefix, position %d is %s", i, m.ID)
 		}
 	}
-	if want := fmt.Sprintf("… %d more matched memories not shown — imem_search finds more", 30-len(shown)); !strings.Contains(block, want) {
+	if want := fmt.Sprintf("… %d more matched memories not shown — call imem_search with offset to page through them", 30-len(shown)); !strings.Contains(block, want) {
 		t.Fatalf("block should say %q:\n%s", want, block)
 	}
 	if !strings.HasSuffix(block, "</infinite-memory>") {
@@ -510,9 +510,17 @@ func TestBuildBlockStaysUnderBudget(t *testing.T) {
 
 func TestBuildBlockNoBudget(t *testing.T) {
 	now := int64(1_000_000)
-	block, shown, _ := BuildBlock("/p", manyMems(30, 300, now), nil, 400, 0, now)
+	block, shown, _ := BuildBlock(BlockInput{PK: "/p", Mems: manyMems(30, 300, now), MaxContentChars: 400, Now: now})
 	if len(shown) != 30 || strings.Contains(block, "not shown") {
 		t.Fatalf("no budget keeps everything, got %d shown", len(shown))
+	}
+}
+
+func TestBuildBlockCountsEveryMatchItDidNotShow(t *testing.T) {
+	now := int64(1_000_000)
+	block, shown, _ := BuildBlock(BlockInput{PK: "/p", Mems: manyMems(3, 50, now), Matched: 40, MaxContentChars: 400, Now: now})
+	if len(shown) != 3 || !strings.Contains(block, "… 37 more matched memories not shown") {
+		t.Fatalf("matches left out before the block was built must be counted too:\n%s", block)
 	}
 }
 
@@ -523,7 +531,8 @@ func TestBuildBlockRulesFillTheRemainder(t *testing.T) {
 		{ID: "r1", Title: "Max args", Kind: "rule", ProjectKey: "/p", Content: strings.Repeat("r", 300), LastSeen: now},
 		{ID: "r2", Title: "LOC limit", Kind: "rule", ProjectKey: "/p", Content: strings.Repeat("r", 300), LastSeen: now},
 	}
-	block, shown, shownRules := BuildBlock("/p", manyMems(2, 300, now), rules, 400, 1450, now)
+	block, shown, shownRules := BuildBlock(BlockInput{PK: "/p", Mems: manyMems(2, 300, now), Rules: rules,
+		MaxContentChars: 400, MaxChars: 1450, Now: now})
 	if len(block) > 1450 || len(shown) != 2 || len(shownRules) != 1 {
 		t.Fatalf("want both memories and one rule in 1450 chars, got %d mems %d rules (%d chars)", len(shown), len(shownRules), len(block))
 	}
@@ -765,7 +774,7 @@ func TestRulesFileTextListsEveryRulePinnedFirstThenByProject(t *testing.T) {
 		{ID: "c", Title: "Code constitution", Content: " 60 LOC, 4 args. ", ProjectKey: "/scratch", Pinned: true},
 		{ID: "d", Title: "Hot local rule", Content: "x", ProjectKey: "/ws/master-data", SeenCount: 9},
 	}
-	got := RulesFileText(rules)
+	got := RulesFileText(rules, nil)
 	if !strings.HasPrefix(got, "# imem standing rules") {
 		t.Fatalf("missing header:\n%s", got)
 	}
@@ -775,5 +784,20 @@ func TestRulesFileTextListsEveryRulePinnedFirstThenByProject(t *testing.T) {
 		"- [rule] Zero rows is an empty slice — Never NotFound. (from registration)\n"
 	if !strings.HasSuffix(got, want) {
 		t.Fatalf("want every rule, pinned first, then by project and seen count:\n%s", got)
+	}
+}
+
+func TestRulesFileTextCarriesEveryPreferenceAfterTheRules(t *testing.T) {
+	rules := []graph.Candidate{{ID: "r", Title: "Use raw SQL", Content: "No query builder.", ProjectKey: "/ws/master-data"}}
+	prefs := []graph.Candidate{
+		{ID: "p2", Title: "Discuss before code", Content: "Design first.", ProjectKey: "/ws/opening-account", SeenCount: 1},
+		{ID: "p1", Title: "Push straight to master", Content: "Personal repos only.", ProjectKey: "/play/infinite-memory", Pinned: true},
+	}
+	got := RulesFileText(rules, prefs)
+	want := "- [rule] Use raw SQL — No query builder. (from master-data)\n\n## Standing preferences\n\n" +
+		"- [preference] Push straight to master — Personal repos only. (from infinite-memory)\n" +
+		"- [preference] Discuss before code — Design first. (from opening-account)\n"
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("every preference belongs in the file too, pinned first:\n%s", got)
 	}
 }

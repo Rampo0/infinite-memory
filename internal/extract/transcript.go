@@ -25,6 +25,7 @@ type Turn struct {
 // is ignored. Verified against real ~/.claude/projects transcripts.
 type envelope struct {
 	Type              string          `json:"type"`
+	UUID              string          `json:"uuid"`
 	IsSidechain       bool            `json:"isSidechain"`
 	IsMeta            bool            `json:"isMeta"`
 	IsAPIErrorMessage bool            `json:"isApiErrorMessage"`

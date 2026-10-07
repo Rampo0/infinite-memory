@@ -103,26 +103,49 @@ func toolText(t *testing.T, r reply) (string, bool) {
 	return res.Content[0].Text, res.IsError
 }
 
-func TestSearchToolDefaultsAndCapsLimit(t *testing.T) {
+func TestSearchToolDefaultsCapsLimitAndPages(t *testing.T) {
 	var gotQ string
-	var gotN []int
-	s := &Server{Search: func(_ context.Context, q string, n int) (string, error) {
+	var gotN, gotOff []int
+	s := &Server{Search: func(_ context.Context, q string, n, off int) (string, error) {
 		gotQ = q
 		gotN = append(gotN, n)
+		gotOff = append(gotOff, off)
 		return "- [fact] Jago Syariah binds — c", nil
 	}}
-	got := serve(t, s, call("imem_search", `{"query":"jago syariah"}`), call("imem_search", `{"query":"x","limit":99}`))
+	got := serve(t, s, call("imem_search", `{"query":"jago syariah"}`), call("imem_search", `{"query":"x","limit":99,"offset":20}`))
 	text, isErr := toolText(t, got[0])
-	if isErr || gotQ != "x" || !strings.Contains(text, "Jago Syariah") || gotN[0] != 8 || gotN[1] != 20 {
-		t.Fatalf("want default 8 and cap 20, got %v (err %v) %q", gotN, isErr, text)
+	if isErr || gotQ != "x" || !strings.Contains(text, "Jago Syariah") || gotN[0] != 8 || gotN[1] != 50 {
+		t.Fatalf("want default 8 and cap 50, got %v (err %v) %q", gotN, isErr, text)
 	}
+	if gotOff[0] != 0 || gotOff[1] != 20 {
+		t.Fatalf("offset must page through the matches, got %v", gotOff)
+	}
+}
+
+func TestSearchToolIsAlwaysLoaded(t *testing.T) {
+	got := serve(t, &Server{}, `{"jsonrpc":"2.0","id":"a","method":"tools/list"}`)
+	var res struct {
+		Tools []struct {
+			Name string         `json:"name"`
+			Meta map[string]any `json:"_meta"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(got[0].Result, &res); err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range res.Tools {
+		if tl.Name == "imem_search" && tl.Meta["anthropic/alwaysLoad"] == true {
+			return
+		}
+	}
+	t.Fatal("imem_search must be loaded upfront, not deferred behind ToolSearch")
 }
 
 // Tool failures are tool results with isError, not protocol errors: the
 // model should read why and carry on.
 func TestToolErrorsAreResults(t *testing.T) {
 	s := &Server{
-		Search: func(context.Context, string, int) (string, error) { return "", errors.New("daemon unreachable") },
+		Search: func(context.Context, string, int, int) (string, error) { return "", errors.New("daemon unreachable") },
 		Remember: func(context.Context, RememberInput) (string, error) {
 			t.Fatal("must not save an invalid memory")
 			return "", nil

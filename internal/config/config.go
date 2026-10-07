@@ -88,7 +88,8 @@ type Config struct {
 	HookFlushOnStop bool `json:"hook_flush_on_stop"`
 	// StopFlushBudgetMS caps how long the daemon holds the flush response
 	// before answering "running" and finishing in the background.
-	StopFlushBudgetMS int `json:"stop_flush_budget_ms"`
+	StopFlushBudgetMS int  `json:"stop_flush_budget_ms"`
+	EnforceSearch     bool `json:"enforce_search"`
 	// AgentRoots are transcript directories inside agent homes (e.g.
 	// ~/.on-call/imem) where an agent's deterministic code may hand the daemon
 	// a transcript outside ~/.claude/projects. Memories
@@ -128,8 +129,8 @@ func Default() Config {
 		ExpandEnabled:            false,
 		ExpandModel:              "claude-haiku-4-5-20251001",
 		ExpandBudgetMS:           30000,
-		RetrieveK:                6,
-		RetrieveMaxChars:         6000,
+		RetrieveK:                noLimit,
+		RetrieveMaxChars:         inlineBudget,
 		MinMatch:                 2.0,
 		RelatedMinWeight:         2,
 		RetrieveTimeoutMS:        300,
@@ -147,6 +148,7 @@ func Default() Config {
 		HookSavedLines:           6,
 		HookFlushOnStop:          true,
 		StopFlushBudgetMS:        90000,
+		EnforceSearch:            true,
 		BackupEnabled:            true,
 		BackupIntervalHours:      4,
 		BackupKeep:               2,
@@ -161,6 +163,15 @@ func Default() Config {
 // hook_summary_lines. Consumers test for <= 0, so any negative works, but
 // everything written back to a Config is normalized to this.
 const noLimit = -1
+
+const inlineBudget = 9500
+
+func clampInline(v int) int {
+	if v <= 0 || v > inlineBudget {
+		return inlineBudget
+	}
+	return v
+}
 
 // normLimit keeps an explicit no-limit request intact, turns an unset (0)
 // field into the compiled default, and passes real caps through.
@@ -195,8 +206,8 @@ func Load() Config {
 	}
 	cfg.RulesFile = ExpandHome(cfg.RulesFile)
 	cfg.RetrieveK = normLimit(cfg.RetrieveK, Default().RetrieveK)
-	cfg.RetrieveMaxChars = normLimit(cfg.RetrieveMaxChars, Default().RetrieveMaxChars)
-	cfg.RulesMaxChars = normLimit(cfg.RulesMaxChars, Default().RulesMaxChars)
+	cfg.RetrieveMaxChars = clampInline(normLimit(cfg.RetrieveMaxChars, Default().RetrieveMaxChars))
+	cfg.RulesMaxChars = clampInline(normLimit(cfg.RulesMaxChars, Default().RulesMaxChars))
 	if cfg.MinMatch < 0 {
 		cfg.MinMatch = 0
 	}
@@ -285,8 +296,10 @@ func (c Config) ExpandBudget() time.Duration {
 // SpawnDir is the neutral working directory for extraction claude spawns, so
 // they never auto-load a project CLAUDE.md.
 func (c Config) SpawnDir() string {
-	return ExpandHome("~/.local/state/infinite-memory/spawn")
+	return filepath.Join(c.StateDir(), "spawn")
 }
+
+func (c Config) StateDir() string { return ExpandHome("~/.local/state/infinite-memory") }
 
 func (c Config) LogPath() string { return ExpandHome(c.LogFile) }
 

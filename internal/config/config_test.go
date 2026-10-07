@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -213,15 +214,6 @@ func TestMinMatchExplicitZeroAndNegative(t *testing.T) {
 	}
 }
 
-func TestRetrieveMaxChars(t *testing.T) {
-	if cfg := loadWith(t, `{}`); cfg.RetrieveMaxChars != 6000 {
-		t.Fatalf("default 6000 (under Claude Code's 10,000 inline cap), got %d", cfg.RetrieveMaxChars)
-	}
-	if cfg := loadWith(t, `{"retrieve_max_chars":-5}`); cfg.RetrieveMaxChars != -1 {
-		t.Fatalf("negative means no cap, got %d", cfg.RetrieveMaxChars)
-	}
-}
-
 func TestRulesAtSessionStartDefaults(t *testing.T) {
 	cfg := loadWith(t, `{}`)
 	if !cfg.RulesOnSessionStart || cfg.RulesMaxChars != 8000 {
@@ -236,5 +228,30 @@ func TestConsolidateDefaults(t *testing.T) {
 	cfg := loadWith(t, `{}`)
 	if cfg.ConsolidateEnabled || cfg.ConsolidateIntervalHours != 24 || cfg.ConsolidateMinJaccard != 0.4 {
 		t.Fatalf("consolidation is opt-in, daily, Jaccard 0.4: %v %d %v", cfg.ConsolidateEnabled, cfg.ConsolidateIntervalHours, cfg.ConsolidateMinJaccard)
+	}
+}
+
+func TestInlineBudgetsLeaveRoomForTheProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		set, want int
+	}{{0, 9500}, {-1, 9500}, {20000, 9500}, {3000, 3000}} {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "c.json")
+		data := fmt.Sprintf(`{"retrieve_max_chars": %d, "rules_max_chars": %d}`, tc.set, tc.set)
+		if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("IMEM_CONFIG", p)
+		cfg := Load()
+		if cfg.RetrieveMaxChars != tc.want || (tc.set != 0 && cfg.RulesMaxChars != tc.want) {
+			t.Fatalf("set %d: want %d, got retrieve %d rules %d", tc.set, tc.want, cfg.RetrieveMaxChars, cfg.RulesMaxChars)
+		}
+	}
+}
+
+func TestRetrieveKDefaultsToNoCap(t *testing.T) {
+	t.Setenv("IMEM_CONFIG", filepath.Join(t.TempDir(), "missing.json"))
+	if got := Load().RetrieveK; got != -1 {
+		t.Fatalf("every match competes for the budget by default, got retrieve_k %d", got)
 	}
 }

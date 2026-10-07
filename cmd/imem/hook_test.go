@@ -217,3 +217,87 @@ func TestHookStopContinuationStillSaves(t *testing.T) {
 			fd.callCount("/v1/extract"), fd.callCount("/v1/flush"))
 	}
 }
+
+func TestHookSlashCommandRetrievesOnItsArguments(t *testing.T) {
+	fd := newFakeDaemon(t)
+	in := hookInput(t.TempDir(), "/reviewing-account-mr https://gitlab/x/-/merge_requests/1014 dont post")
+	out, _ := runCLIStdin(t, addrOf(fd), in, "hook", "user-prompt")
+	body := fd.body("/v1/retrieve")
+	if body == nil || body["prompt"] != "reviewing-account-mr https://gitlab/x/-/merge_requests/1014 dont post" {
+		t.Fatalf("a skill invocation is real work and must retrieve on its arguments, got %v", body)
+	}
+	if !strings.Contains(out, "imem-protocol") {
+		t.Fatalf("the protocol must ride along, got %q", out)
+	}
+}
+
+func TestHookPathPromptIsNotACommand(t *testing.T) {
+	fd := newFakeDaemon(t)
+	in := hookInput(t.TempDir(), "/Users/x/repo/usecase/guard.go why does this panic")
+	runCLIStdin(t, addrOf(fd), in, "hook", "user-prompt")
+	if body := fd.body("/v1/retrieve"); body == nil || body["prompt"] != "/Users/x/repo/usecase/guard.go why does this panic" {
+		t.Fatalf("a prompt that starts with a path is an ordinary prompt, got %v", body)
+	}
+}
+
+func TestHookBareCommandStillGetsTheProtocol(t *testing.T) {
+	fd := newFakeDaemon(t)
+	out, _ := runCLIStdin(t, addrOf(fd), hookInput(t.TempDir(), "/lanjut-review"), "hook", "user-prompt")
+	if !strings.Contains(out, "imem-protocol") || fd.callCount("/v1/retrieve") != 1 {
+		t.Fatalf("a bare command still gets the protocol and a context retrieve, got %q", out)
+	}
+}
+
+func TestProtocolHasNoOptOut(t *testing.T) {
+	if strings.Contains(selfSearchProtocol, "when the tool is available") {
+		t.Fatal("the protocol must not offer a way out of searching")
+	}
+}
+
+const searchLine = `{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[` +
+	`{"type":"tool_use","id":"t1","name":"mcp__imem__imem_search","input":{"query":"imem"}}]}}`
+
+const uuidPrompt = `{"type":"user","uuid":"u1","message":{"role":"user","content":"fix the guard"}}`
+
+func TestHookStopBlocksATurnThatNeverSearched(t *testing.T) {
+	fd := newFakeDaemon(t)
+	p := transcriptWith(t, uuidPrompt, replyLine)
+	out, _ := runCLIStdin(t, addrOf(fd), stopInput(t, p, "Committed as bddae456.", false), "hook", "stop")
+	if !strings.Contains(out, `"decision":"block"`) || !strings.Contains(out, "imem_search") {
+		t.Fatalf("a turn without imem_search must be sent back to search, got %q", out)
+	}
+	if fd.callCount("/v1/flush") != 0 {
+		t.Fatal("a blocked stop must not flush yet")
+	}
+	if b := fd.body("/v1/gate"); b["prompt_id"] != "u1" || b["searched"] != false {
+		t.Fatalf("the gate needs the prompt and whether it searched, got %v", b)
+	}
+}
+
+func TestHookStopPassesATurnThatSearched(t *testing.T) {
+	fd := newFakeDaemon(t)
+	p := transcriptWith(t, uuidPrompt, searchLine, replyLine)
+	out, _ := runCLIStdin(t, addrOf(fd), stopInput(t, p, "Committed as bddae456.", false), "hook", "stop")
+	if strings.Contains(out, `"decision"`) || fd.callCount("/v1/flush") != 1 {
+		t.Fatalf("a turn that searched must stop normally and save, got %q", out)
+	}
+}
+
+func TestHookStopGateCanBeTurnedOff(t *testing.T) {
+	fd := newFakeDaemon(t)
+	p := transcriptWith(t, uuidPrompt, replyLine)
+	c := cliCall{addr: addrOf(fd), stdin: stopInput(t, p, "Committed as bddae456.", false), extra: `, "enforce_search": false`}
+	out, _ := runCLIWith(t, c, "hook", "stop")
+	if strings.Contains(out, `"decision"`) || fd.callCount("/v1/flush") != 1 || fd.callCount("/v1/gate") != 1 {
+		t.Fatalf("with enforcement off the gate only counts, got %q", out)
+	}
+}
+
+func TestHookStopContinuationRecordsTheSearch(t *testing.T) {
+	fd := newFakeDaemon(t)
+	p := transcriptWith(t, uuidPrompt, replyLine, searchLine, replyLine)
+	runCLIStdin(t, addrOf(fd), stopInput(t, p, "Committed as bddae456.", true), "hook", "stop")
+	if b := fd.body("/v1/gate"); b["searched"] != true {
+		t.Fatalf("a search made after the gate fired must be counted, got %v", b)
+	}
+}

@@ -41,7 +41,7 @@ var validKinds = map[string]bool{"fact": true, "decision": true, "preference": t
 // Server answers MCP requests. Search and Remember do the work (func fields,
 // the repo's injection style); both return the text the model reads.
 type Server struct {
-	Search   func(ctx context.Context, query string, limit int) (string, error)
+	Search   func(ctx context.Context, query string, limit, offset int) (string, error)
 	Remember func(ctx context.Context, in RememberInput) (string, error)
 	Version  string
 	ReadOnly bool
@@ -168,8 +168,9 @@ func (s *Server) call(ctx context.Context, name string, args json.RawMessage) (s
 	switch name {
 	case "imem_search":
 		var a struct {
-			Query string `json:"query"`
-			Limit int    `json:"limit"`
+			Query  string `json:"query"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil || strings.TrimSpace(a.Query) == "" {
 			return "", fmt.Errorf("imem_search needs a non-empty query")
@@ -177,13 +178,13 @@ func (s *Server) call(ctx context.Context, name string, args json.RawMessage) (s
 		switch {
 		case a.Limit <= 0:
 			a.Limit = 8
-		case a.Limit > 20:
-			a.Limit = 20
+		case a.Limit > maxSearchLimit:
+			a.Limit = maxSearchLimit
 		}
 		if s.Search == nil {
 			return "", fmt.Errorf("search is not available")
 		}
-		return s.Search(ctx, a.Query, a.Limit)
+		return s.Search(ctx, a.Query, a.Limit, max(a.Offset, 0))
 	case "imem_remember":
 		if s.ReadOnly {
 			return "", fmt.Errorf("unknown tool %q", name)
@@ -215,6 +216,8 @@ func toolResult(text string, isErr bool) map[string]any {
 	}
 }
 
+const maxSearchLimit = 50
+
 var tools = []map[string]any{
 	{
 		"name": "imem_search",
@@ -224,15 +227,18 @@ var tools = []map[string]any{
 			"conversation: the automatic <infinite-memory> block only matched the prompt's literal words, and prompts " +
 			"often lack them (\"lanjut\", \"fix that\", \"yang kemarin\"). Query with specific nouns — repo or service " +
 			"names, features, error codes, identifiers; English terms match best, Indonesian works too, and several " +
-			"keywords fit in one query. Results are dated leads: verify before relying on them.",
+			"keywords fit in one query. Results are dated leads: verify before relying on them. Use offset to page " +
+			"past results you already have.",
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"query": map[string]any{"type": "string", "description": "What to look for, e.g. \"jago syariah link 4000703\""},
-				"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20, "description": "Max results (default 8)"},
+				"query":  map[string]any{"type": "string", "description": "What to look for, e.g. \"jago syariah link 4000703\""},
+				"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": maxSearchLimit, "description": "Max results (default 8)"},
+				"offset": map[string]any{"type": "integer", "minimum": 0, "description": "Skip this many best matches (default 0)"},
 			},
 			"required": []string{"query"},
 		},
+		"_meta": map[string]any{"anthropic/alwaysLoad": true},
 	},
 	{
 		"name": "imem_remember",

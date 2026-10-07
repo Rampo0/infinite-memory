@@ -1,11 +1,12 @@
 # infinite-memory
 
 Persistent memory for Claude Code, backed by Memgraph. Every session and every subagent
-starts with the standing rules (pinned core rules first); every prompt gets the past
-memories that match it — a vague follow-up ("lanjut", "fix that") is matched with the
-last exchange — plus a protocol line telling the model to call `imem_search` with its own
-keywords before answering; turns get new memories extracted, reconciled against what is
-already known. Headless `claude -p` sessions and the bots in `~/scratch` get the same
+starts with every standing rule and preference (pinned core items first); every prompt —
+skill invocations included — gets the past memories that match it, as many as Claude Code
+inlines, and a vague follow-up ("lanjut", "fix that") is matched with the last exchange.
+A protocol line tells the model to call `imem_search` with its own keywords before
+answering, and a turn that never searched is sent back once to do it. Every turn gets new
+memories extracted, reconciled against what is already known, and nothing is skipped. Headless `claude -p` sessions and the bots in `~/scratch` get the same
 loop at agent trust (rules demoted to facts, never grading your memories). No embeddings,
 no API key: extraction runs headless `claude -p` on your subscription login; retrieval is
 idf-weighted keyword + entity matching over the graph, and runs in milliseconds.
@@ -44,7 +45,7 @@ claude mcp add --scope user imem -- ~/.local/bin/imem mcp   # imem_search / imem
 Hooks are registered as additional array entries in `~/.claude/settings.json`
 (`SessionStart` → standing rules, `UserPromptSubmit` → retrieve, `Stop`/`SessionEnd` →
 extract). New Claude Code sessions pick them up automatically. Allowlisting
-`mcp__imem__imem_search` is safe (read-only); leave `imem_remember` behind its
+`mcp__imem__imem_search` is safe (it only records which memories a session was shown); leave `imem_remember` behind its
 permission prompt — a model that read a malicious file could otherwise plant a rule.
 
 ## launchd (macOS): run the daemon at login
@@ -168,13 +169,17 @@ every escaped statement.
   - boosts: recency `2·e^(-age/14d)` (age from last seen *or last used*), `seen_count`,
     `used_count`, a penalty per dispute, and `same_project_boost`.
 - **Injection budget.** Claude Code inlines `additionalContext` only up to 10,000 chars
-  and shows a 2KB preview of anything larger, so the block is capped at
-  `retrieve_max_chars` (6,000), best-scored first, ending with "… N more matched —
-  imem_search finds more". Memories already injected earlier in the session are skipped
-  (they are still in context); `/clear` and compaction reset that.
+  and shows a 2KB preview of anything larger. Every match above the floor competes
+  (`retrieve_k` -1), best-scored first, up to `retrieve_max_chars` (9,500 — the most that
+  fits next to the protocol line); the block ends with how many more matched and points at
+  `imem_search` with `offset` to page through them. Memories already injected earlier in
+  the session are skipped (they are still in context); `/clear` and compaction reset that,
+  and the log survives a daemon restart (`~/.local/state/infinite-memory/injections.json`).
+  A `/skill args` prompt is retrieved on its arguments; a bare `/command` on the last exchange.
 - **Standing rules arrive once, at SessionStart** (also after `/clear`, resume and
-  compaction): this project's rules — a parent workspace counts as this project — then
-  its preferences, then other projects' rules and preferences, within `rules_max_chars`.
+  compaction). With a rules file (below) every rule and preference lives there and the
+  block carries only pinned items; without one: this project's rules — a parent workspace
+  counts as this project — then its preferences, then other projects', within `rules_max_chars`.
   Per prompt, rules still surface like any memory when their topic matches.
 - **Extraction**: the worker reads the transcript from the stored cursor — the text of each
   turn, the final report of every Agent/Task subagent, prompts typed while Claude was busy,
@@ -279,19 +284,26 @@ model writes its own queries with the whole conversation as context — the job 
 per-prompt LLM expander did in tens of seconds, now free. Every prompt's injection ends with
 an `<imem-protocol>` line (also when nothing matched or the daemon is down) asking the model
 to call `imem_search` at least once per turn with keywords it derives itself; the MCP
-instructions and tool description say the same. Searches carry `CLAUDE_CODE_SESSION_ID`, so
-their results join the session's injection log: later prompts don't repeat them, and the
-extractor grades them used / wrong like injected ones.
+instructions and tool description say the same. The tool is marked `anthropic/alwaysLoad`,
+so it is in context from the first turn instead of behind a ToolSearch hop. Searches carry
+`CLAUDE_CODE_SESSION_ID`, so the extractor grades their results used / wrong like injected
+ones; they never hide a memory from the hook, because a subagent's search carries its parent's id.
+
+**Stop gate** (`enforce_search`, default on): when a turn ends, the Stop hook reads the
+transcript since the last real prompt; if it holds no `imem_search` call, the hook answers
+`decision: block` once for that prompt, so Claude searches and corrects its answer before
+the turn closes. Headless sessions are never blocked. `imem status` shows how often Claude
+searched on its own in the last 24h and how often the gate fired.
 
 `imem mcp --agent --cwd <project>` is the bots' read-only variant: `imem_search` only, results
 prefixed as untrusted reference data, scoped to `--cwd`, never recorded against a session.
 
 | tool | does |
 |---|---|
-| `imem_search(query, limit≤20)` | `/v1/memories` (same ranking, no floor): one line per memory with kind, title, content, age and source repo |
+| `imem_search(query, limit≤50, offset)` | `/v1/memories` (same ranking, no floor): one line per memory with kind, title, content, age and source repo |
 | `imem_remember(title, content, kind, entities?)` | `/v1/remember` → `SaveBatch` under the session's project, in a per-day `mcp-` session (dedup and same-title supersede apply) |
 
-The hook block's "… N more matched — imem_search finds more" line points the model at it.
+The hook block's "… N more matched memories not shown — call imem_search with offset" line points the model at it.
 
 ## Ops
 
@@ -402,9 +414,9 @@ headless (`CLAUDE_CODE_SESSION_ATTENDED=0`, an `sdk-*` `CLAUDE_CODE_ENTRYPOINT`,
 
 Claude Code inlines at most 10,000 chars per hook output, and the live rules run to ~110K, so
 SessionStart alone can't carry them all. With `"rules_file": "~/.claude/imem-rules.md"` the
-daemon writes every live rule there (pinned first, then by project, no ages, so the text stays
-stable and cacheable) at startup and at every session start, and the SessionStart / SubagentStart
-block then carries only preferences and the protocol. Import it from `~/.claude/CLAUDE.md` with a
+daemon writes every live rule and then every preference there (pinned first, then by project,
+no ages, so the text stays stable and cacheable) at startup and at every session start, and the
+SessionStart / SubagentStart block then carries only pinned items and the protocol. Import it from `~/.claude/CLAUDE.md` with a
 line `@imem-rules.md`: Claude Code loads imports into the system prompt of every session,
 headless `claude -p` and subagent alike, with no hook cap. A session reads the file as the
 previous session start left it. Without the import line, set no `rules_file`: the rules would
@@ -435,12 +447,13 @@ optional. Retrieval knobs:
 |---|---|---|
 | `extract_effort` | high | `--effort` of every extraction spawn |
 | `extract_max_usage` | 0.85 | defer extraction above this share of the 5-hour window (-1 = never) |
-| `retrieve_k` | 6 | max memories per prompt before the char budget |
-| `retrieve_max_chars` | 6000 | per-prompt block budget (Claude Code inlines ≤10,000) |
+| `retrieve_k` | -1 | max memories per prompt before the char budget (-1: every match competes) |
+| `retrieve_max_chars` | 9500 | per-prompt block budget; capped at 9,500 so block + protocol stay under Claude Code's 10,000 |
+| `enforce_search` | true | Stop gate: send a turn back once when it never called `imem_search` |
 | `min_match` | 2.0 | relevance floor on the hook path (0 disables) |
 | `related_min_weight` | 2 | minimum `RELATED` edge weight the 1-hop query follows |
 | `rules_on_session_start` | true | standing rules once per session instead of per prompt |
-| `rules_max_chars` | 8000 | SessionStart block budget |
+| `rules_max_chars` | 8000 | SessionStart block budget (capped at 9,500) |
 | `rules_k` | 50 | standing rules considered before the budget (0 = off) |
 | `ignore_cwds` | `["~/.claude/double-shot-latte"]` | sessions memory never touches |
 | `consolidate_enabled` | false | daily consolidation in the daemon |
@@ -450,7 +463,7 @@ The capped knobs share one convention:
 
 | value | `retrieve_k`, `retrieve_max_chars`, `rules_max_chars` | `rules_k` | `hook_summary_lines`, `hook_saved_lines` |
 |---|---|---|---|
-| `-1` (any negative) | no cap | no cap — every rule | no cap — one line per memory |
+| `-1` (any negative) | no cap (char budgets: 9,500) | no cap — every rule | no cap — one line per memory |
 | `0` / absent | compiled default | **rules off** | compiled default (6) |
 | `n > 0` | n | best n rules | first n lines, rest as "… N more" |
 
