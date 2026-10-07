@@ -74,6 +74,10 @@ func main() {
 		cmdSetup(os.Args[2:])
 	case "doctor":
 		cmdDoctor(os.Args[2:])
+	case "dispute":
+		cmdDispute(os.Args[2:])
+	case "audit-saves":
+		cmdAuditSaves(os.Args[2:])
 	case "consolidate":
 		cmdConsolidate(os.Args[2:])
 	case "reindex":
@@ -128,6 +132,8 @@ func usage() {
   imem setup [--restore <dump>] [--dry-run]   install on this machine: config, hooks, MCP, rules import, launchd
   imem doctor [--json]                 check every piece of the install, with the fix for each failure
   imem agents [list | add <name> <dir> | remove <name>]   bot transcript roots (drop-ins, no restart)
+  imem dispute wrong|outdated [--archive] <id or title words>   grade a memory by hand; --archive takes it out of retrieval
+  imem audit-saves [--adopt]           sessions of the last 7 days with unextracted lines; --adopt hands earlier ones to the sweep
 `)
 }
 
@@ -751,6 +757,15 @@ func printSelfSearch(cfg config.Config) {
 	}
 	if err := getJSON(cfg.BaseURL()+"/v1/gate", &g); err == nil {
 		fmt.Printf("self-search: %d/%d prompts searched in the last 24h, gate fired %d\n", g.Searched, g.Prompts, g.Fired)
+	}
+	var l struct {
+		Used       int `json:"used"`
+		SearchOnly int `json:"search_only"`
+		Learned    int `json:"learned"`
+	}
+	if err := getJSON(cfg.BaseURL()+"/v1/learning", &l); err == nil {
+		fmt.Printf("learning: %d used memories in the last 24h, %d found only by imem_search, %d aliases learned\n",
+			l.Used, l.SearchOnly, l.Learned)
 	}
 }
 

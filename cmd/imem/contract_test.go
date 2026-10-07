@@ -168,6 +168,9 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 	mux.HandleFunc("GET /v1/gate", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, map[string]any{"prompts": 4, "searched": 3, "fired": 1})
 	})
+	mux.HandleFunc("GET /v1/learning", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, map[string]any{"used": 5, "search_only": 2, "learned": 3})
+	})
 	mux.HandleFunc("POST /v1/retrieve/preview", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, map[string]any{"context": "<infinite-memory project=\"/c\">\n" +
 			"Long-term memories from previous sessions (background knowledge; verify before relying on it):\n" +
@@ -367,5 +370,12 @@ func TestStatusShowsSelfSearchCompliance(t *testing.T) {
 	out, _ := runCLI(t, addrOf(newFakeDaemon(t)), "status")
 	if !strings.Contains(out, "self-search: 3/4 prompts searched in the last 24h, gate fired 1") {
 		t.Fatalf("status must show how often Claude searched on its own:\n%s", out)
+	}
+}
+
+func TestStatusShowsWhatTheIndexLearned(t *testing.T) {
+	out, _ := runCLI(t, addrOf(newFakeDaemon(t)), "status")
+	if !strings.Contains(out, "learning: 5 used memories in the last 24h, 2 found only by imem_search, 3 aliases learned") {
+		t.Fatalf("status must show the hook-miss rate and what was learned:\n%s", out)
 	}
 }

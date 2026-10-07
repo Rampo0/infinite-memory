@@ -314,6 +314,13 @@ so it is in context from the first turn instead of behind a ToolSearch hop. Sear
 `CLAUDE_CODE_SESSION_ID`, so the extractor grades their results used / wrong like injected
 ones; they never hide a memory from the hook, because a subagent's search carries its parent's id.
 
+**Learning from Claude's own searches**: when the extractor grades a memory `used` and that memory
+reached the session only through `imem_search` (the hook never surfaced it), up to 3 words from
+the search query that the memory lacks become its aliases (at most 20 per memory), so the hook
+finds it from those words next time. Bot transcripts never teach. `imem status` shows, for the
+last 24h, how many used memories only a search found (the hook-miss rate) and how many aliases
+were learned.
+
 **Stop gate** (`enforce_search`, default on): when a turn ends, the Stop hook reads the
 transcript since the last real prompt; if it holds no `imem_search` call, the hook answers
 `decision: block` once for that prompt, so Claude searches and corrects its answer before
@@ -446,6 +453,13 @@ line `@imem-rules.md`: Claude Code loads imports into the system prompt of every
 headless `claude -p` and subagent alike, with no hook cap. A session reads the file as the
 previous session start left it. Without the import line, set no `rules_file`: the rules would
 otherwise reach no session at all.
+
+### Grading by hand and auditing saves
+
+`imem dispute wrong|outdated [--archive] <id or title words>` grades a memory the way the
+extractor would; `--archive` also takes it out of retrieval (`REMOVE m.archived` undoes it).
+`imem audit-saves` lists sessions of the last 7 days whose transcript still has lines past the
+extraction cursor; `--adopt` hands earlier sessions (seen before the sweep existed) to the sweep.
 
 ### Pinned rules
 

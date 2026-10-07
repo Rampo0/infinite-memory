@@ -57,6 +57,20 @@ SET m.aliases = $aliases,
 			"toks": toAny(textutil.Tokenize(strings.Join(aliases, " "), 24))})
 }
 
+const maxAliases = 20
+
+func (s *Store) LearnAliases(ctx context.Context, id string, terms []string) error {
+	return s.write(ctx, `MATCH (m:Memory {id: $id})
+WHERE size(coalesce(m.aliases, [])) < $cap
+WITH m, [a IN $terms WHERE NOT a IN coalesce(m.aliases, [])] AS added,
+     [k IN $terms WHERE NOT k IN coalesce(m.keywords, [])] AS fresh
+SET m.aliases = coalesce(m.aliases, []) + added,
+    m.keywords = coalesce(m.keywords, []) + fresh,
+    m.alias_only = coalesce(m.alias_only, []) + fresh,
+    m.learned_aliases = coalesce(m.learned_aliases, 0) + size(added)`,
+		map[string]any{"id": id, "terms": toAny(terms), "cap": maxAliases})
+}
+
 // write runs one autocommit write statement.
 func (s *Store) write(ctx context.Context, q string, params map[string]any) error {
 	sess := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})

@@ -2,6 +2,7 @@ package extract
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -160,4 +161,48 @@ func callsTool(raw json.RawMessage, name string) bool {
 		}
 	}
 	return false
+}
+
+func CountLines(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 256*1024)
+	buf := make([]byte, 256*1024)
+	var n int64
+	for {
+		k, err := r.Read(buf)
+		n += int64(bytes.Count(buf[:k], []byte{'\n'}))
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+	}
+}
+
+func TranscriptMeta(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 256*1024)
+	for i := 0; i < 50; i++ {
+		line, err := r.ReadBytes('\n')
+		var meta struct {
+			CWD        string `json:"cwd"`
+			Entrypoint string `json:"entrypoint"`
+		}
+		if json.Unmarshal(line, &meta) == nil && meta.CWD != "" {
+			return meta.CWD, strings.HasPrefix(meta.Entrypoint, "sdk")
+		}
+		if err != nil {
+			return "", false
+		}
+	}
+	return "", false
 }

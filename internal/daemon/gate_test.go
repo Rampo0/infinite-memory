@@ -60,3 +60,13 @@ func TestPageOfSkipsTheOffset(t *testing.T) {
 		t.Fatalf("an offset past the end is an empty page, got %+v", got)
 	}
 }
+
+func TestLearningStatsCountTheLastDay(t *testing.T) {
+	l := newLearnLog()
+	l.Record(learnResult{Used: 3, SearchOnly: 1, Aliases: map[string][]string{"m1": {"rekening", "dana"}}})
+	l.Record(learnResult{Used: 1})
+	st := l.Stats(0)
+	if st.Used != 4 || st.SearchOnly != 1 || st.Learned != 2 {
+		t.Fatalf("got %+v", st)
+	}
+}

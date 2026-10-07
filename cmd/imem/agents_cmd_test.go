@@ -63,3 +63,9 @@ func TestDoctorJSONContract(t *testing.T) {
 		t.Fatalf("daemon reachable, hooks missing in an empty home: %v", names)
 	}
 }
+
+func TestDisputeNeedsAVerdict(t *testing.T) {
+	if _, code := runCLI(t, addrOf(newFakeDaemon(t)), "dispute", "maybe", "some title"); code != 2 {
+		t.Fatalf("an unknown verdict is a usage error, got exit %d", code)
+	}
+}

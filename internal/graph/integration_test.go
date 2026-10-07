@@ -1027,3 +1027,47 @@ func TestTouchSessionFeedsTheSweep(t *testing.T) {
 	}
 	t.Fatalf("touched session %s missing from the sweep", sid)
 }
+
+func TestLearnAliasesAddsSearchableTermsUpToACap(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d", time.Now().UnixNano())
+	saved, err := s.SaveBatch(ctx, pk, "learn-"+pk, time.Now().Unix(), []MemoryIn{{
+		Title: "BCA RDN creation", Content: "Callback rejected when the signature is stale.", Kind: "fact"}})
+	if err != nil || len(saved) != 1 {
+		t.Fatalf("seed: %v %v", saved, err)
+	}
+	id := saved[0].ID
+	if err := s.LearnAliases(ctx, id, []string{"rekening", "nasabah"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LearnAliases(ctx, id, []string{"rekening", "dana"}); err != nil {
+		t.Fatal(err)
+	}
+	q1, _, _, err := s.Candidates(ctx, []string{"nasabah"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range onlyPK(q1, pk) {
+		found = found || c.ID == id
+	}
+	if !found {
+		t.Fatal("a learned alias must make the memory findable by that word")
+	}
+}
+
+func TestMemoryTargetsFindAnyKindByTitleWords(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	pk := fmt.Sprintf("/itest/%d", time.Now().UnixNano())
+	saved, err := s.SaveBatch(ctx, pk, "dispute-"+pk, time.Now().Unix(), []MemoryIn{{
+		Title: "Rules file verified in restricted sessions " + pk, Content: "Wrong claim.", Kind: "decision"}})
+	if err != nil || len(saved) != 1 {
+		t.Fatalf("seed: %v %v", saved, err)
+	}
+	got, err := s.MemoryTargets(ctx, "verified in restricted sessions "+pk)
+	if err != nil || len(got) != 1 || got[0].ID != saved[0].ID || got[0].Kind != "decision" {
+		t.Fatalf("a decision must be findable by its title: %+v %v", got, err)
+	}
+}

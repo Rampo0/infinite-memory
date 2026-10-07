@@ -41,6 +41,7 @@ type server struct {
 	// injections tracks what each session was already shown.
 	injections *injectionLog
 	gates      *gateLog
+	learning   *learnLog
 	roots      *rootSet
 	// byKind fetches every live memory of one kind (func field so handlers
 	// test without Memgraph, the same injection shape as Expander.Run).
@@ -113,6 +114,7 @@ func newServer(cfg config.Config, store *graph.Store, log *slog.Logger) *server 
 		corpus:     corpus,
 		injections: loadInjectionLog(cfg),
 		gates:      newGateLog(),
+		learning:   newLearnLog(),
 		roots:      newRootSet(cfg.AgentRoots, config.AgentsDir()),
 		byKind: func(ctx context.Context, kind string) ([]graph.Candidate, error) {
 			return store.ByKind(ctx, kind, -1)
@@ -144,6 +146,8 @@ func (s *server) newWorker() *Worker {
 		}
 		return out, err
 	}
+	worker.Searched = s.injections.Since
+	worker.Learn = s.learnFrom
 	// B2: and the memories this session was shown since its last extraction.
 	worker.Shown = func(sid string, since int64) []extract.Known {
 		var out []extract.Known
@@ -183,6 +187,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /v1/flush", s.handleFlush)
 	mux.HandleFunc("POST /v1/gate", s.handleGate)
 	mux.HandleFunc("GET /v1/gate", s.handleGateStats)
+	mux.HandleFunc("GET /v1/learning", s.handleLearningStats)
 	mux.HandleFunc("POST /v1/backup", s.handleBackup)
 	mux.HandleFunc("GET /v1/backups", s.handleBackups)
 	return mux

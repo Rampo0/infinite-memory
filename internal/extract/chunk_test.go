@@ -159,3 +159,19 @@ func TestLastTurnSearchSeesASearchAfterThePrompt(t *testing.T) {
 		t.Fatalf("tool results and task notifications do not start a new prompt: id=%q searched=%v", id, searched)
 	}
 }
+
+func TestCountLines(t *testing.T) {
+	p := writeLines(t, "a", "b", "c")
+	if n, err := CountLines(p); err != nil || n != 3 {
+		t.Fatalf("got %d, %v", n, err)
+	}
+}
+
+func TestTranscriptMetaReadsCwdAndEntrypoint(t *testing.T) {
+	p := writeLines(t, `{"type":"queue-operation"}`,
+		`{"type":"user","cwd":"/Users/x/repo","entrypoint":"sdk-cli","message":{"role":"user","content":"hi"}}`)
+	cwd, headless := TranscriptMeta(p)
+	if cwd != "/Users/x/repo" || !headless {
+		t.Fatalf("got %q %v", cwd, headless)
+	}
+}

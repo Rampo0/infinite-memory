@@ -1,13 +1,11 @@
 package daemon
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"io"
 	"os"
 	"time"
 
+	"github.com/Rampo0/infinite-memory/internal/extract"
 	"github.com/Rampo0/infinite-memory/internal/graph"
 )
 
@@ -55,29 +53,8 @@ func (sw *sweeper) behind(c graph.SessionSource) bool {
 	if err != nil || sw.now().Sub(fi.ModTime()) < sw.idle || fi.ModTime().Unix() <= c.UpdatedAt {
 		return false
 	}
-	lines, err := countLines(c.TranscriptPath)
+	lines, err := extract.CountLines(c.TranscriptPath)
 	return err == nil && lines > c.Cursor
-}
-
-func countLines(path string) (int64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	r := bufio.NewReaderSize(f, 256*1024)
-	buf := make([]byte, 256*1024)
-	var n int64
-	for {
-		k, err := r.Read(buf)
-		n += int64(bytes.Count(buf[:k], []byte{'\n'}))
-		if err == io.EOF {
-			return n, nil
-		}
-		if err != nil {
-			return n, err
-		}
-	}
 }
 
 func (s *server) startSweepLoop() {

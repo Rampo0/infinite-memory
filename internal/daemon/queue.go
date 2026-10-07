@@ -262,9 +262,11 @@ type Worker struct {
 	// the extractor to grade (B2). Nil skips feedback.
 	Shown func(sid string, since int64) []extract.Known
 
-	Spawn   func(ctx context.Context, prompt string) (string, error)
-	Usage   func(ctx context.Context) (float64, error)
-	Requeue func(j Job)
+	Spawn    func(ctx context.Context, prompt string) (string, error)
+	Usage    func(ctx context.Context) (float64, error)
+	Requeue  func(j Job)
+	Learn    func(r learnResult)
+	Searched func(sid string, since int64) []injected
 
 	mu       sync.Mutex
 	fails    map[string]int
@@ -342,6 +344,7 @@ type attempt struct {
 	chunk extract.Chunk
 	from  int
 	now   int64
+	since int64
 }
 
 func planDelta(c extract.Chunk, j Job) step {
@@ -384,6 +387,9 @@ func (w *Worker) process(j Job) (SaveReport, error) {
 
 func (w *Worker) readAttempt(ctx context.Context, j Job) (attempt, error) {
 	a := attempt{j: j, pk: project.ResolveKey(j.CWD), now: time.Now().Unix()}
+	w.mu.Lock()
+	a.since = w.lastRun[j.SessionID]
+	w.mu.Unlock()
 	cur, err := w.Store.GetCursor(ctx, j.SessionID)
 	if err != nil {
 		return a, fmt.Errorf("get cursor: %w", err)
@@ -470,10 +476,7 @@ func (w *Worker) promptContext(ctx context.Context, a attempt, foreign bool) ext
 		}
 	}
 	if w.Shown != nil {
-		w.mu.Lock()
-		since := w.lastRun[a.j.SessionID]
-		w.mu.Unlock()
-		pc.Shown = w.Shown(a.j.SessionID, since)
+		pc.Shown = w.Shown(a.j.SessionID, a.since)
 	}
 	return pc
 }
@@ -497,11 +500,19 @@ func (w *Worker) persist(ctx context.Context, a attempt, mems []graph.MemoryIn, 
 		} else {
 			w.Log.Info("feedback", "session", a.j.SessionID, "verdicts", len(verdicts))
 		}
+		w.learn(a, verdicts)
 	}
 	if len(rep.Memories) == 0 {
 		rep.Skipped = "nothing worth saving"
 	}
 	return rep, nil
+}
+
+func (w *Worker) learn(a attempt, verdicts []graph.Verdict) {
+	if w.Learn == nil || w.Searched == nil {
+		return
+	}
+	w.Learn(learnAliases(w.Searched(a.j.SessionID, a.since), verdicts))
 }
 
 func (w *Worker) advance(ctx context.Context, a attempt, saved int) error {
