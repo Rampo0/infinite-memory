@@ -388,3 +388,36 @@ func TestExtractCarriesTheHeadlessFlag(t *testing.T) {
 		t.Fatalf("an agent extract must reach the worker flagged, got %+v", jobs[0])
 	}
 }
+
+func TestSessionStartWritesEveryRuleToTheRulesFileAndKeepsPreferences(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "imem-rules.md")
+	s := rulesServer(t, config.Config{RulesOnSessionStart: true, RulesMaxChars: 8000, MaxMemoryContentChars: 400, RulesFile: path})
+	block, _ := sessionStart(s, "s1", "startup")["context"].(string)
+	if strings.Contains(block, "[rule]") || !strings.Contains(block, "- [preference] Prefers stdlib") {
+		t.Fatalf("with a rules file the block carries preferences only:\n%s", block)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"- [rule] Local rule — Functions under 60 lines. (from here)", "- [rule] Foreign rule — x (from other)"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("rules file misses %q:\n%s", want, data)
+		}
+	}
+}
+
+func TestWriteFileAtomicReplacesWholeFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.md")
+	for _, text := range []string{"first version, longer", "second"} {
+		if err := writeFileAtomic(path, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if data, _ := os.ReadFile(path); string(data) != "second" {
+		t.Fatalf("got %q", data)
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(path)); len(entries) != 1 {
+		t.Fatalf("temp files left behind: %v", entries)
+	}
+}

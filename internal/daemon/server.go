@@ -134,6 +134,7 @@ func Run(cfg config.Config) error {
 	// Memgraph may be down at startup: log and keep serving, the schema is
 	// re-attempted on the next successful health check.
 	s.ensureSchema(context.Background())
+	go s.refreshRulesFile()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -332,6 +333,11 @@ func (s *server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, empty)
 		return
 	}
+	inFile := 0
+	if s.cfg.RulesFile != "" {
+		s.writeRulesFile(rules)
+		inFile, rules = len(rules), nil
+	}
 	prefs, err := s.byKind(ctx, "preference")
 	if err != nil {
 		s.log.Warn("session-start preferences failed", "err", err)
@@ -358,7 +364,52 @@ func (s *server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		"preferences", nPrefs, "omitted", len(standing)-len(shown), "chars", len(block))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"context": block, "rules": nRules, "preferences": nPrefs, "omitted": len(standing) - len(shown),
+		"rules_file": inFile,
 	})
+}
+
+func (s *server) writeRulesFile(rules []graph.Candidate) {
+	text := retrieve.RulesFileText(rules)
+	if old, err := os.ReadFile(s.cfg.RulesFile); err == nil && string(old) == text {
+		return
+	}
+	if err := writeFileAtomic(s.cfg.RulesFile, text); err != nil {
+		s.log.Warn("rules file not written", "path", s.cfg.RulesFile, "err", err)
+		return
+	}
+	s.log.Info("rules file written", "path", s.cfg.RulesFile, "rules", len(rules), "chars", len(text))
+}
+
+func writeFileAtomic(path, text string) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".imem-rules-*")
+	if err != nil {
+		return err
+	}
+	_, werr := f.WriteString(text)
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		os.Remove(f.Name())
+		return fmt.Errorf("write %s: %v %v", f.Name(), werr, cerr)
+	}
+	if err := os.Chmod(f.Name(), 0o644); err != nil {
+		os.Remove(f.Name())
+		return err
+	}
+	return os.Rename(f.Name(), path)
+}
+
+func (s *server) refreshRulesFile() {
+	if s.cfg.RulesFile == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rules, err := s.byKind(ctx, "rule")
+	if err != nil {
+		s.log.Warn("rules file refresh failed", "err", err)
+		return
+	}
+	s.writeRulesFile(rules)
 }
 
 // handleRules lists every live rule, this project's first, one line each in

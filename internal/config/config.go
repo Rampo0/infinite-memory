@@ -93,6 +93,7 @@ type Config struct {
 	// from those transcripts are never saved as rules or preferences: a bot
 	// writes after reading untrusted input, and rules reach every session.
 	AgentRoots []string `json:"agent_roots"`
+	RulesFile  string   `json:"rules_file"`
 	// IgnoreCWDs are directories whose sessions memory never touches: no
 	// retrieve, no extract. For headless spawns that are not conversations —
 	// double-shot-latte's continuation judge runs `claude -p` in its own dir
@@ -188,6 +189,7 @@ func Load() Config {
 	for i, r := range cfg.IgnoreCWDs {
 		cfg.IgnoreCWDs[i] = ExpandHome(r)
 	}
+	cfg.RulesFile = ExpandHome(cfg.RulesFile)
 	cfg.RetrieveK = normLimit(cfg.RetrieveK, Default().RetrieveK)
 	cfg.RetrieveMaxChars = normLimit(cfg.RetrieveMaxChars, Default().RetrieveMaxChars)
 	cfg.RulesMaxChars = normLimit(cfg.RulesMaxChars, Default().RulesMaxChars)

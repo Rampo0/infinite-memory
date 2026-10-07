@@ -67,3 +67,13 @@ func TestPickPinTarget(t *testing.T) {
 		t.Fatalf("a single match is picked, got %+v %v", got, ok)
 	}
 }
+
+func TestStandingMessageNamesTheRulesFile(t *testing.T) {
+	got := standingMessage(client.SessionStartResponse{Preferences: 21, Omitted: 29, RulesFile: 285}, 39)
+	if got != "imem: 285 rules in the rules file, 21 preferences (39ms) · 29 more over budget" {
+		t.Fatalf("got %q", got)
+	}
+	if got := standingMessage(client.SessionStartResponse{Rules: 3, Preferences: 1}, 5); got != "imem: 3 standing rules, 1 preferences (5ms)" {
+		t.Fatalf("got %q", got)
+	}
+}

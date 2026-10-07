@@ -121,6 +121,7 @@ type SessionStartResponse struct {
 	Rules       int    `json:"rules"`
 	Preferences int    `json:"preferences"`
 	Omitted     int    `json:"omitted"`
+	RulesFile   int    `json:"rules_file"`
 }
 
 func SessionStart(baseURL string, req SessionStartRequest, timeout time.Duration) (SessionStartResponse, error) {

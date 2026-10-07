@@ -291,6 +291,17 @@ func hookStop(cfg config.Config, in hookio.Input) {
 // hookStanding injects the standing rules once per session (also after
 // /clear and compaction, when the earlier copy left the context) and into
 // every subagent at launch. Fast path: fail open.
+func standingMessage(resp client.SessionStartResponse, ms int64) string {
+	msg := fmt.Sprintf("imem: %d standing rules, %d preferences (%dms)", resp.Rules, resp.Preferences, ms)
+	if resp.RulesFile > 0 {
+		msg = fmt.Sprintf("imem: %d rules in the rules file, %d preferences (%dms)", resp.RulesFile, resp.Preferences, ms)
+	}
+	if resp.Omitted > 0 {
+		msg += fmt.Sprintf(" · %d more over budget", resp.Omitted)
+	}
+	return msg
+}
+
 func hookStanding(cfg config.Config, in hookio.Input, source, event string) {
 	start := time.Now()
 	resp, err := client.SessionStart(cfg.BaseURL(), client.SessionStartRequest{
@@ -301,11 +312,7 @@ func hookStanding(cfg config.Config, in hookio.Input, source, event string) {
 		block = strings.TrimSpace(resp.Context)
 	}
 	if cfg.HookShowRetrieved && block != "" && event == "SessionStart" {
-		msg = fmt.Sprintf("imem: %d standing rules, %d preferences (%dms)",
-			resp.Rules, resp.Preferences, time.Since(start).Milliseconds())
-		if resp.Omitted > 0 {
-			msg += fmt.Sprintf(" · %d more over budget", resp.Omitted)
-		}
+		msg = standingMessage(resp, time.Since(start).Milliseconds())
 	}
 	_ = hookio.EmitContext(os.Stdout, event, withProtocol(block), msg)
 }

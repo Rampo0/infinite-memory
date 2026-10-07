@@ -27,6 +27,7 @@
   "hook_flush_on_stop": true,
   "stop_flush_budget_ms": 90000,
   "agent_roots": [],
+  "rules_file": "",
   "ignore_cwds": ["~/.claude/double-shot-latte"],
   "backup_enabled": true,
   "backup_interval_hours": 4,

@@ -383,6 +383,18 @@ headless (`CLAUDE_CODE_SESSION_ATTENDED=0`, an `sdk-*` `CLAUDE_CODE_ENTRYPOINT`,
 (isolated, add-only, rules and preferences demoted) even though its transcript sits under
 `~/.claude/projects`. `ignore_cwds` still drops spawns that are not conversations at all.
 
+### All rules in every session: the rules file
+
+Claude Code inlines at most 10,000 chars per hook output, and the live rules run to ~110K, so
+SessionStart alone can't carry them all. With `"rules_file": "~/.claude/imem-rules.md"` the
+daemon writes every live rule there (pinned first, then by project, no ages, so the text stays
+stable and cacheable) at startup and at every session start, and the SessionStart / SubagentStart
+block then carries only preferences and the protocol. Import it from `~/.claude/CLAUDE.md` with a
+line `@imem-rules.md`: Claude Code loads imports into the system prompt of every session,
+headless `claude -p` and subagent alike, with no hook cap. A session reads the file as the
+previous session start left it. Without the import line, set no `rules_file`: the rules would
+otherwise reach no session at all.
+
 ### Pinned rules
 
 `imem pin <id or title words>` marks a rule or preference as core: it leads the SessionStart

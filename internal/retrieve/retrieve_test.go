@@ -757,3 +757,23 @@ func TestSortRulesPinnedBeatProjectAndCap(t *testing.T) {
 		t.Fatalf("a pinned rule must survive the cap ahead of local ones, got %+v", out)
 	}
 }
+
+func TestRulesFileTextListsEveryRulePinnedFirstThenByProject(t *testing.T) {
+	rules := []graph.Candidate{
+		{ID: "b", Title: "Zero rows is an empty slice", Content: "Never NotFound.", ProjectKey: "/ws/registration", SeenCount: 1},
+		{ID: "a", Title: "Use raw SQL", Content: "No query builder.", ProjectKey: "/ws/master-data", SeenCount: 3},
+		{ID: "c", Title: "Code constitution", Content: " 60 LOC, 4 args. ", ProjectKey: "/scratch", Pinned: true},
+		{ID: "d", Title: "Hot local rule", Content: "x", ProjectKey: "/ws/master-data", SeenCount: 9},
+	}
+	got := RulesFileText(rules)
+	if !strings.HasPrefix(got, "# imem standing rules") {
+		t.Fatalf("missing header:\n%s", got)
+	}
+	want := "- [rule] Code constitution — 60 LOC, 4 args. (from scratch)\n" +
+		"- [rule] Hot local rule — x (from master-data)\n" +
+		"- [rule] Use raw SQL — No query builder. (from master-data)\n" +
+		"- [rule] Zero rows is an empty slice — Never NotFound. (from registration)\n"
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("want every rule, pinned first, then by project and seen count:\n%s", got)
+	}
+}
