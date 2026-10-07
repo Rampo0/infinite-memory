@@ -114,7 +114,8 @@ func usage() {
   imem expand "prompt" [--cwd path]    show what the LLM expander would add (no search)
   imem eval [--file f] [--mode hook|search] [--json]   score retrieval on labelled cases
   imem entities [--project] [--limit N]    list entities by mention count (global by default)
-  imem rules [--cwd path] [--limit N] [--pinned]   every live standing rule, pinned then this project first, one per line
+  imem rules [--cwd path] [--limit N] [--pinned] [--here]   every live standing rule, pinned then this project first, one per line;
+                                       --here: pinned + this repo/workspace + global rules and preferences, full text
   imem pin|unpin <id or title words>   pin a rule/preference: always injected first (SessionStart, subagents, agents)
   imem consolidate [--plan|--apply] [--limit N] [--min-jaccard F] [--max-usage F]   merge near-duplicate memories (lists clusters by default)
   imem consolidate --archive [--apply]  memories injected 20+ times, never used, unseen 60d+ (archive = out of retrieval)
@@ -182,7 +183,8 @@ func hookMain(args []string) {
 const selfSearchProtocol = "<imem-protocol>Before answering, call imem_search at least once with keywords you derive " +
 	"from the whole conversation: repo, service, feature and error names, identifiers, in English and Indonesian. " +
 	"The memories injected automatically only matched this prompt's literal words; use offset to page through more " +
-	"matches.</imem-protocol>"
+	"matches. Before writing code, reviewing, committing, opening an MR or drafting Slack/GitLab text, run " +
+	"`imem rules --here` once this session and follow its rules.</imem-protocol>"
 
 func commandPrompt(prompt string) string {
 	if !strings.HasPrefix(prompt, "/") {
@@ -366,8 +368,8 @@ func waitForReply(path, reply string, limit time.Duration) {
 func standingMessage(resp client.SessionStartResponse, ms int64) string {
 	msg := fmt.Sprintf("imem: %d standing rules, %d preferences (%dms)", resp.Rules, resp.Preferences, ms)
 	if resp.RulesFile > 0 {
-		msg = fmt.Sprintf("imem: %d rules + %d preferences in the rules file, %d pinned (%dms)",
-			resp.RulesFile, resp.PreferencesFile, resp.Rules+resp.Preferences, ms)
+		msg = fmt.Sprintf("imem: %d rules + %d preferences on demand (imem rules --here), %d pinned inline (%dms)",
+			resp.RulesFile, resp.PreferencesFile, resp.Pinned, ms)
 	}
 	if resp.Omitted > 0 {
 		msg += fmt.Sprintf(" · %d more over budget", resp.Omitted)
@@ -384,7 +386,7 @@ func hookStanding(cfg config.Config, in hookio.Input, source, event string) {
 	if err == nil {
 		block = strings.TrimSpace(resp.Context)
 	}
-	if cfg.HookShowRetrieved && block != "" && event == "SessionStart" {
+	if cfg.HookShowRetrieved && (block != "" || resp.RulesFile > 0) && event == "SessionStart" {
 		msg = standingMessage(resp, time.Since(start).Milliseconds())
 	}
 	_ = hookio.EmitContext(os.Stdout, event, withProtocol(block), msg)
@@ -512,6 +514,8 @@ func cmdRules(args []string) {
 			}
 		case "--pinned":
 			vals.Set("pinned", "1")
+		case "--here":
+			vals.Set("here", "1")
 		}
 	}
 	if vals.Get("cwd") == "" {

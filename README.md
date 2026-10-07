@@ -44,8 +44,8 @@ make doctor                      # every piece of the install, with the fix for 
 
 `imem setup` is idempotent and backs up every file it changes (`*.bak-imem-<time>`). It writes
 `rules_file` into `~/.config/infinite-memory/config.json` (creating it when missing, keeping
-every other key), merges the five hooks and the `mcp__imem__imem_search` allow rule into
-`~/.claude/settings.json` (other hooks and the key order stay as they are; a stale imem hook is
+every other key), merges the five hooks and the allow rules for `mcp__imem__imem_search` and
+`imem rules` (`Bash(imem rules:*)` plus the absolute-path form) into `~/.claude/settings.json` (other hooks and the key order stay as they are; a stale imem hook is
 replaced where it sits), adds `@imem-rules.md` to `~/.claude/CLAUDE.md`, registers the `imem`
 MCP server at user scope with `alwaysLoad`, renders the launchd job for this machine's home and
 binary, then restarts the daemon onto the installed binary. `--dry-run` prints what it would do.
@@ -201,9 +201,11 @@ every escaped statement.
   the session are skipped (they are still in context); `/clear` and compaction reset that,
   and the log survives a daemon restart (`~/.local/state/infinite-memory/injections.json`).
   A `/skill args` prompt is retrieved on its arguments; a bare `/command` on the last exchange.
-- **Standing rules arrive once, at SessionStart** (also after `/clear`, resume and
-  compaction). With a rules file (below) every rule and preference lives there and the
-  block carries only pinned items; without one: this project's rules — a parent workspace
+- **Standing rules are fetched on demand.** With a rules file (below) it carries only the
+  fetch instruction and the pinned items; Claude runs `imem rules --here` before code, review,
+  commit, MR or Slack/GitLab work. The SessionStart block is then empty (subagents get the
+  pinned items, in case their type skips CLAUDE.md). Without a rules file, SessionStart (also
+  after `/clear`, resume and compaction) carries this project's rules — a parent workspace
   counts as this project — then its preferences, then other projects', within `rules_max_chars`.
   Per prompt, rules still surface like any memory when their topic matches.
 - **Extraction**: the worker reads the transcript from the stored cursor — the text of each
@@ -309,7 +311,8 @@ every escaped statement.
 model writes its own queries with the whole conversation as context — the job the old
 per-prompt LLM expander did in tens of seconds, now free. Every prompt's injection ends with
 an `<imem-protocol>` line (also when nothing matched or the daemon is down) asking the model
-to call `imem_search` at least once per turn with keywords it derives itself; the MCP
+to call `imem_search` at least once per turn with keywords it derives itself, and to run
+`imem rules --here` once per session before code, review, commit, MR or Slack/GitLab work; the MCP
 instructions and tool description say the same. The tool is marked `anthropic/alwaysLoad`,
 so it is in context from the first turn instead of behind a ToolSearch hop. Searches carry
 `CLAUDE_CODE_SESSION_ID`, so the extractor grades their results used / wrong like injected
@@ -344,7 +347,9 @@ The hook block's "… N more matched memories not shown — call imem_search wit
 imem status                  # daemon + memgraph health, per-project counts,
                              # and recent extraction runs (including failures)
 imem search "query"          # search memories (global, boosted for current project)
-imem rules [--cwd p] [--limit N]   # every live rule, this project first, one per line
+imem rules [--cwd p] [--limit N] [--pinned]   # every live rule, this project first, one per line
+imem rules --here [--cwd p]  # pinned + this repo/workspace + global (~, ~/.claude) rules and
+                             # preferences, full text, then a count of what other projects hold
 imem entities [--project] [--limit N]   # entities by mention count (global by default)
 imem entity <name...>        # one entity: relations (verb/weight) + memories mentioning it
 imem eval [--mode hook|search] [--json]   # score retrieval on labelled cases (Evaluation)
@@ -443,17 +448,20 @@ headless (`CLAUDE_CODE_SESSION_ATTENDED=0`, an `sdk-*` `CLAUDE_CODE_ENTRYPOINT`,
 (isolated, add-only, rules and preferences demoted) even though its transcript sits under
 `~/.claude/projects`. `ignore_cwds` still drops spawns that are not conversations at all.
 
-### All rules in every session: the rules file
+### Rules on demand: the rules file
 
-Claude Code inlines at most 10,000 chars per hook output, and the live rules run to ~110K, so
-SessionStart alone can't carry them all. With `"rules_file": "~/.claude/imem-rules.md"` the
-daemon writes every live rule and then every preference there (pinned first, then by project,
-no ages, so the text stays stable and cacheable) at startup and at every session start, and the
-SessionStart / SubagentStart block then carries only pinned items and the protocol. Import it from `~/.claude/CLAUDE.md` with a
-line `@imem-rules.md`: Claude Code loads imports into the system prompt of every session,
-headless `claude -p` and subagent alike, with no hook cap. A session reads the file as the
-previous session start left it. Without the import line, set no `rules_file`: the rules would
-otherwise reach no session at all.
+The live rules and preferences run to ~160K chars: too big for a hook (10,000-char inline cap)
+and too costly to import into every session (~39K tokens, mostly other repos' rules). With
+`"rules_file": "~/.claude/imem-rules.md"` the daemon writes, at startup and every session start,
+a short instruction plus the pinned items only (no ages, so the text stays stable). Import it
+from `~/.claude/CLAUDE.md` with a line `@imem-rules.md`. The instruction tells Claude to run
+`<abs path>/imem rules --here` once per session before writing code, reviewing, committing or
+pushing, opening an MR, or drafting Slack or GitLab text. `--here` returns, full text and
+`SessionRules` order: pinned items, this project's rules and preferences (a parent workspace
+counts as this project), the global ones (stated in `~` or `~/.claude`), then a line counting
+what other projects hold. Plain `imem rules` (ai-review's input) and `/v1/rules?pinned=1`
+(agentkit's) are unchanged. `imem doctor` fails the rules file when it grows past 10,000 bytes.
+Without the import line, set no `rules_file`: the fetch instruction would reach no session.
 
 ### Grading by hand and auditing saves
 
@@ -464,10 +472,12 @@ extraction cursor; `--adopt` hands earlier sessions (seen before the sweep exist
 
 ### Pinned rules
 
-`imem pin <id or title words>` marks a rule or preference as core: it leads the SessionStart
-and SubagentStart block in every repo, survives the `rules_k` cap and the char budget ahead
-of local rules, and is listed first by `imem rules` (`--pinned` lists only those). Keep the
-pinned set small — the whole block must stay under Claude Code's 10,000-char inline cap.
+`imem pin <id or title words>` marks a rule or preference as core: it is inlined in the rules
+file (every session, every repo, no fetch needed), leads the SubagentStart block, survives the
+`rules_k` cap and the char budget ahead of local rules, and is listed first by `imem rules`
+(`--pinned` lists only those). Pin the universal rules that must hold even when nothing is
+fetched — the code constitution, outward-action approvals — and keep the set small: the file
+must stay under 10,000 bytes.
 
 ## Coexistence with other memory systems
 

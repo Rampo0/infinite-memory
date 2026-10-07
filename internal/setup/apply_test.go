@@ -145,6 +145,17 @@ func TestDoctorNamesTheFixForAMissingPiece(t *testing.T) {
 	}
 }
 
+func TestDoctorFlagsARulesFileThatInlinesEverything(t *testing.T) {
+	e, _ := testEnv(t)
+	path := filepath.Join(e.Home, "imem-rules.md")
+	_ = os.WriteFile(path, []byte(strings.Repeat("- [rule] x\n", 1200)), 0o644)
+	e.Cfg = config.Config{RulesFile: path}
+	c := checkRulesFile(e)
+	if c.OK || !strings.Contains(c.Fix, "restart the daemon") {
+		t.Fatalf("a rules file over the inline cap must fail with a fix, got %+v", c)
+	}
+}
+
 func TestApplyBootstrapsAJobThatIsNotLoaded(t *testing.T) {
 	e, _ := testEnv(t)
 	if err := Apply(e); err != nil {

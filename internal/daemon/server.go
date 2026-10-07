@@ -369,19 +369,22 @@ func (s *server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("session-start preferences failed", "err", err)
 	}
 	pk := project.ResolveKey(req.CWD)
-	out := s.standingBlock(pk, rules, prefs)
+	out := s.standingBlock(pk, req.Source, rules, prefs)
 	s.log.Info("session-start", "project", pk, "source", req.Source, "rules", out["rules"],
 		"preferences", out["preferences"], "omitted", out["omitted"], "chars", len(out["context"].(string)))
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *server) standingBlock(pk string, rules, prefs []graph.Candidate) map[string]any {
+func (s *server) standingBlock(pk, source string, rules, prefs []graph.Candidate) map[string]any {
 	standing := retrieve.SessionRules(rules, prefs, pk)
-	out := map[string]any{"rules_file": 0, "preferences_file": 0}
+	out := map[string]any{"rules_file": 0, "preferences_file": 0, "pinned": 0}
 	if s.cfg.RulesFile != "" {
 		s.writeRulesFile(rules, prefs)
-		out["rules_file"], out["preferences_file"] = len(rules), len(prefs)
 		standing = pinnedOnly(standing)
+		out["rules_file"], out["preferences_file"], out["pinned"] = len(rules), len(prefs), len(standing)
+		if source != "subagent" {
+			standing = nil
+		}
 	} else if s.cfg.RulesK > 0 && len(standing) > s.cfg.RulesK {
 		standing = standing[:s.cfg.RulesK]
 	}
@@ -402,7 +405,7 @@ func (s *server) standingBlock(pk string, rules, prefs []graph.Candidate) map[st
 }
 
 func (s *server) writeRulesFile(rules, prefs []graph.Candidate) {
-	text := retrieve.RulesFileText(rules, prefs)
+	text := retrieve.RulesFileText(rules, prefs, rulesFetchCommand())
 	if old, err := os.ReadFile(s.cfg.RulesFile); err == nil && string(old) == text {
 		return
 	}
@@ -411,6 +414,14 @@ func (s *server) writeRulesFile(rules, prefs []graph.Candidate) {
 		return
 	}
 	s.log.Info("rules file written", "path", s.cfg.RulesFile, "rules", len(rules), "preferences", len(prefs), "chars", len(text))
+}
+
+func rulesFetchCommand() string {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "imem"
+	}
+	return exe + " rules --here"
 }
 
 func writeFileAtomic(path, text string) error {
@@ -467,12 +478,42 @@ func (s *server) handleRules(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	if qv.Get("here") == "1" {
+		s.rulesHere(ctx, w, pk, rules)
+		return
+	}
 	if qv.Get("pinned") == "1" {
 		rules = pinnedOnly(rules)
 	}
 	sorted := retrieve.SortRules(rules, pk, limit, nil)
 	lines := retrieve.RuleLines(pk, sorted, s.cfg.MaxMemoryContentChars, time.Now().Unix())
 	writeJSON(w, http.StatusOK, map[string]any{"project": pk, "lines": lines, "count": len(lines)})
+}
+
+func (s *server) rulesHere(ctx context.Context, w http.ResponseWriter, pk string, rules []graph.Candidate) {
+	prefs, err := s.byKind(ctx, "preference")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	home, _ := os.UserHomeDir()
+	kept, skipped := retrieve.HereSet(rules, prefs, pk, home)
+	lines := retrieve.StandingLines(kept)
+	if len(skipped) > 0 {
+		lines = append(lines, skippedFooter(skipped))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"project": pk, "lines": lines, "count": len(kept)})
+}
+
+func skippedFooter(skipped []graph.Candidate) string {
+	rules := 0
+	for _, c := range skipped {
+		if c.Kind == "rule" {
+			rules++
+		}
+	}
+	return fmt.Sprintf("… %d rules + %d preferences from other projects not shown (imem rules lists every rule)",
+		rules, len(skipped)-rules)
 }
 
 func pinnedOnly(cs []graph.Candidate) []graph.Candidate {

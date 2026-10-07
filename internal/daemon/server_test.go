@@ -390,26 +390,43 @@ func TestExtractCarriesTheHeadlessFlag(t *testing.T) {
 	}
 }
 
-func TestSessionStartWritesEveryRuleAndPreferenceToTheRulesFile(t *testing.T) {
+func TestSessionStartWritesTheFetchInstructionAndPinnedItemsToTheRulesFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "imem-rules.md")
 	s := rulesServer(t, config.Config{RulesOnSessionStart: true, RulesMaxChars: 8000, MaxMemoryContentChars: 400, RulesFile: path})
+	pinFirstRule(s)
 	out := sessionStart(s, "s1", "startup")
-	block, _ := out["context"].(string)
-	if strings.Contains(block, "[rule]") || strings.Contains(block, "[preference]") {
-		t.Fatalf("with a rules file nothing unpinned rides in the capped block:\n%s", block)
-	}
-	if out["rules_file"] != float64(2) || out["preferences_file"] != float64(1) {
-		t.Fatalf("the response must count what the file holds: %v", out)
+	if out["rules_file"] != float64(2) || out["preferences_file"] != float64(1) || out["pinned"] != float64(1) {
+		t.Fatalf("the response must count live rules, preferences and pinned items: %v", out)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"- [rule] Local rule — Functions under 60 lines. (from here)", "- [rule] Foreign rule — x (from other)",
-		"- [preference] Prefers stdlib — No frameworks. (from here)"} {
-		if !strings.Contains(string(data), want) {
-			t.Fatalf("rules file misses %q:\n%s", want, data)
-		}
+	if !strings.Contains(string(data), " rules --here`") || !strings.Contains(string(data), "- [rule] Foreign rule — x (from other)") {
+		t.Fatalf("rules file needs the fetch command and the pinned rule:\n%s", data)
+	}
+	if strings.Contains(string(data), "Local rule") || strings.Contains(string(data), "Prefers stdlib") {
+		t.Fatalf("unpinned items are fetched on demand, not written:\n%s", data)
+	}
+}
+
+func TestRulesEndpointHereListsThisProjectInFull(t *testing.T) {
+	s := rulesServer(t, config.Config{MaxMemoryContentChars: 5})
+	w := httptest.NewRecorder()
+	s.handleRules(w, httptest.NewRequest(http.MethodGet, "/v1/rules?cwd=/here&here=1", nil))
+	var out struct {
+		Lines []string `json:"lines"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"- [rule] Local rule — Functions under 60 lines. (from here)",
+		"- [preference] Prefers stdlib — No frameworks. (from here)",
+		"… 1 rules + 0 preferences from other projects not shown (imem rules lists every rule)",
+	}
+	if strings.Join(out.Lines, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("want this project's rules and preferences unclipped plus a footer:\n%q", out.Lines)
 	}
 }
 
@@ -455,13 +472,16 @@ func TestExtractRemembersWhereTheTranscriptLives(t *testing.T) {
 	}
 }
 
-func TestSessionStartBlockKeepsPinnedItemsWithARulesFile(t *testing.T) {
+func TestSessionStartLeavesPinnedItemsToTheRulesFileExceptForSubagents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "imem-rules.md")
 	s := rulesServer(t, config.Config{RulesOnSessionStart: true, RulesMaxChars: 8000, MaxMemoryContentChars: 400, RulesFile: path})
 	pinFirstRule(s)
-	block, _ := sessionStart(s, "s1", "startup")["context"].(string)
+	if block, _ := sessionStart(s, "s1", "startup")["context"].(string); block != "" {
+		t.Fatalf("the session already imports the rules file, nothing rides in the block:\n%s", block)
+	}
+	block, _ := sessionStart(s, "s1", "subagent")["context"].(string)
 	if !strings.Contains(block, "- [rule] Foreign rule") || strings.Contains(block, "Local rule") {
-		t.Fatalf("pinned items lead every session, the rest live in the file:\n%s", block)
+		t.Fatalf("a subagent gets the pinned items only:\n%s", block)
 	}
 }
 

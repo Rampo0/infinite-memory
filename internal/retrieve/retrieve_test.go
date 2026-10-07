@@ -767,37 +767,92 @@ func TestSortRulesPinnedBeatProjectAndCap(t *testing.T) {
 	}
 }
 
-func TestRulesFileTextListsEveryRulePinnedFirstThenByProject(t *testing.T) {
+func TestRulesFileTextInlinesOnlyPinnedItems(t *testing.T) {
 	rules := []graph.Candidate{
-		{ID: "b", Title: "Zero rows is an empty slice", Content: "Never NotFound.", ProjectKey: "/ws/registration", SeenCount: 1},
 		{ID: "a", Title: "Use raw SQL", Content: "No query builder.", ProjectKey: "/ws/master-data", SeenCount: 3},
 		{ID: "c", Title: "Code constitution", Content: " 60 LOC, 4 args. ", ProjectKey: "/scratch", Pinned: true},
-		{ID: "d", Title: "Hot local rule", Content: "x", ProjectKey: "/ws/master-data", SeenCount: 9},
 	}
-	got := RulesFileText(rules, nil)
+	prefs := []graph.Candidate{
+		{ID: "p2", Title: "Discuss before code", Content: "Design first.", ProjectKey: "/ws/opening-account"},
+		{ID: "p1", Title: "Push straight to master", Content: "Personal repos only.", ProjectKey: "/play/infinite-memory", Pinned: true},
+	}
+	got := RulesFileText(rules, prefs, "/bin/imem rules --here")
 	if !strings.HasPrefix(got, "# imem standing rules") {
 		t.Fatalf("missing header:\n%s", got)
 	}
 	want := "- [rule] Code constitution — 60 LOC, 4 args. (from scratch)\n" +
-		"- [rule] Hot local rule — x (from master-data)\n" +
-		"- [rule] Use raw SQL — No query builder. (from master-data)\n" +
-		"- [rule] Zero rows is an empty slice — Never NotFound. (from registration)\n"
+		"- [preference] Push straight to master — Personal repos only. (from infinite-memory)\n"
 	if !strings.HasSuffix(got, want) {
-		t.Fatalf("want every rule, pinned first, then by project and seen count:\n%s", got)
+		t.Fatalf("want the pinned rule then the pinned preference at the end:\n%s", got)
+	}
+	for _, unpinned := range []string{"Use raw SQL", "Discuss before code"} {
+		if strings.Contains(got, unpinned) {
+			t.Fatalf("unpinned %q must be fetched on demand, not inlined:\n%s", unpinned, got)
+		}
 	}
 }
 
-func TestRulesFileTextCarriesEveryPreferenceAfterTheRules(t *testing.T) {
-	rules := []graph.Candidate{{ID: "r", Title: "Use raw SQL", Content: "No query builder.", ProjectKey: "/ws/master-data"}}
+func TestRulesFileTextTellsWhenAndHowToFetch(t *testing.T) {
+	got := RulesFileText(nil, nil, "/bin/imem rules --here")
+	for _, want := range []string{"`/bin/imem rules --here`", "code", "review", "commit", "MR", "Slack", "GitLab"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the instruction must mention %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "- [") {
+		t.Fatalf("nothing pinned means no inlined items:\n%s", got)
+	}
+}
+
+func TestHereSetKeepsPinnedLocalAndHomeItems(t *testing.T) {
+	rules := []graph.Candidate{
+		{ID: "foreign", Kind: "rule", ProjectKey: "/other", SeenCount: 9},
+		{ID: "pinned", Kind: "rule", ProjectKey: "/other", Pinned: true},
+		{ID: "local", Kind: "rule", ProjectKey: "/ws/here", SeenCount: 5},
+		{ID: "workspace", Kind: "rule", ProjectKey: "/ws", SeenCount: 1},
+		{ID: "sibling", Kind: "rule", ProjectKey: "/ws/here-not", SeenCount: 1},
+		{ID: "claude", Kind: "rule", ProjectKey: "/home/u/.claude", SeenCount: 3},
+		{ID: "home", Kind: "rule", ProjectKey: "/home/u", SeenCount: 1},
+		{ID: "under-claude", Kind: "rule", ProjectKey: "/home/u/.claude/dsl", SeenCount: 1},
+	}
 	prefs := []graph.Candidate{
-		{ID: "p2", Title: "Discuss before code", Content: "Design first.", ProjectKey: "/ws/opening-account", SeenCount: 1},
-		{ID: "p1", Title: "Push straight to master", Content: "Personal repos only.", ProjectKey: "/play/infinite-memory", Pinned: true},
+		{ID: "pref-foreign", Kind: "preference", ProjectKey: "/other"},
+		{ID: "pref-local", Kind: "preference", ProjectKey: "/ws/here"},
+		{ID: "pref-home", Kind: "preference", ProjectKey: "/home/u/.claude"},
 	}
-	got := RulesFileText(rules, prefs)
-	want := "- [rule] Use raw SQL — No query builder. (from master-data)\n\n## Standing preferences\n\n" +
-		"- [preference] Push straight to master — Personal repos only. (from infinite-memory)\n" +
-		"- [preference] Discuss before code — Design first. (from opening-account)\n"
-	if !strings.HasSuffix(got, want) {
-		t.Fatalf("every preference belongs in the file too, pinned first:\n%s", got)
+	kept, skipped := HereSet(rules, prefs, "/ws/here", "/home/u")
+	if got, want := candIDs(kept), "pinned,local,workspace,pref-local,claude,home,pref-home"; got != want {
+		t.Fatalf("kept: want %s, got %s", want, got)
 	}
+	if got, want := candIDs(skipped), "foreign,sibling,under-claude,pref-foreign"; got != want {
+		t.Fatalf("skipped: want %s, got %s", want, got)
+	}
+}
+
+func TestHereSetWithoutHomeKeepsNoHomeItems(t *testing.T) {
+	rules := []graph.Candidate{{ID: "keyless", Kind: "rule"}, {ID: "rootless", Kind: "rule", ProjectKey: "/.claude"}}
+	if kept, _ := HereSet(rules, nil, "/ws/here", ""); len(kept) != 0 {
+		t.Fatalf("an unknown home must not turn other projects global: %+v", kept)
+	}
+}
+
+func TestStandingLinesKeepFullContentWithoutAge(t *testing.T) {
+	long := strings.Repeat("y", 500)
+	items := []graph.Candidate{
+		{Kind: "rule", Title: "Long", Content: " " + long + " ", ProjectKey: "/ws/here", LastSeen: 1},
+		{Kind: "preference", Title: "Bare", Content: "x"},
+	}
+	got := StandingLines(items)
+	want := []string{"- [rule] Long — " + long + " (from here)", "- [preference] Bare — x"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("want %q, got %q", want, got)
+	}
+}
+
+func candIDs(cs []graph.Candidate) string {
+	ids := make([]string, len(cs))
+	for i, c := range cs {
+		ids[i] = c.ID
+	}
+	return strings.Join(ids, ",")
 }

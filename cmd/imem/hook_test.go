@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -245,6 +247,26 @@ func TestHookBareCommandStillGetsTheProtocol(t *testing.T) {
 	out, _ := runCLIStdin(t, addrOf(fd), hookInput(t.TempDir(), "/lanjut-review"), "hook", "user-prompt")
 	if !strings.Contains(out, "imem-protocol") || fd.callCount("/v1/retrieve") != 1 {
 		t.Fatalf("a bare command still gets the protocol and a context retrieve, got %q", out)
+	}
+}
+
+func TestProtocolAsksForRulesBeforeWork(t *testing.T) {
+	for _, want := range []string{"imem rules --here", "code", "review", "commit", "MR", "Slack"} {
+		if !strings.Contains(selfSearchProtocol, want) {
+			t.Fatalf("the protocol must mention %q:\n%s", want, selfSearchProtocol)
+		}
+	}
+}
+
+func TestHookSessionStartReportsTheRulesFileWithAnEmptyBlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"context": "", "rules_file": 2, "preferences_file": 1, "pinned": 0})
+	}))
+	t.Cleanup(srv.Close)
+	in, _ := json.Marshal(map[string]any{"session_id": "s1", "cwd": t.TempDir(), "source": "startup", "hook_event_name": "SessionStart"})
+	out, _ := runCLIStdin(t, strings.TrimPrefix(srv.URL, "http://"), string(in), "hook", "session-start")
+	if !strings.Contains(out, "imem: 2 rules + 1 preferences on demand (imem rules --here), 0 pinned inline") {
+		t.Fatalf("the status line must show even when nothing is pinned:\n%s", out)
 	}
 }
 

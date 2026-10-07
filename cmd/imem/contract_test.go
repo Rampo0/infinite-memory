@@ -357,6 +357,22 @@ func TestContractRulesLines(t *testing.T) {
 	}
 }
 
+func TestContractRulesHereAsksForThisProjectOnly(t *testing.T) {
+	fd := newFakeDaemon(t)
+	if _, code := runCLI(t, addrOf(fd), "rules", "--cwd", "/Users/x/accountworkspace"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if fd.query("/v1/rules").Has("here") {
+		t.Fatal("plain imem rules must keep the ai-review contract and send no here param")
+	}
+	if _, code := runCLI(t, addrOf(fd), "rules", "--here", "--cwd", "/Users/x/accountworkspace"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if got := fd.query("/v1/rules").Get("here"); got != "1" {
+		t.Fatalf("--here must reach the daemon as here=1, got %q", got)
+	}
+}
+
 // A down daemon must fail loudly (ai-review then falls back), never print an
 // empty rules list that reads as "no rules".
 func TestContractRulesDown(t *testing.T) {

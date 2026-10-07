@@ -127,7 +127,7 @@ func ensureSettings(e Env) (string, error) {
 	if err != nil || !changed {
 		return "", err
 	}
-	return "register the imem hooks and allow imem_search in " + path, writeWithBackup(e, path, out, 0o644)
+	return "register the imem hooks and allow imem_search and imem rules in " + path, writeWithBackup(e, path, out, 0o644)
 }
 
 func ensureImport(e Env) (string, error) {

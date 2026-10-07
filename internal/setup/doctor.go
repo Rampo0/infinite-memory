@@ -54,11 +54,19 @@ func checkImport(e Env) Check {
 	return Check{Name: "rules import", OK: ok, Detail: "rules_file + " + RulesImport + " in ~/.claude/CLAUDE.md", Fix: fixSetup}
 }
 
+const maxRulesFileBytes = 10000
+
 func checkRulesFile(e Env) Check {
 	c := Check{Name: "rules file", Detail: e.Cfg.RulesFile,
 		Fix: "start a Claude Code session or restart the daemon; it writes the file"}
-	if fi, err := os.Stat(e.Cfg.RulesFile); err == nil && e.Cfg.RulesFile != "" {
-		c.OK, c.Detail = true, fmt.Sprintf("%s (%d bytes)", e.Cfg.RulesFile, fi.Size())
+	fi, err := os.Stat(e.Cfg.RulesFile)
+	if err != nil || e.Cfg.RulesFile == "" {
+		return c
+	}
+	c.OK, c.Detail = fi.Size() <= maxRulesFileBytes, fmt.Sprintf("%s (%d bytes)", e.Cfg.RulesFile, fi.Size())
+	if !c.OK {
+		c.Fix = fmt.Sprintf("over %d bytes: restart the daemon on a current imem so it inlines pinned items only, "+
+			"or unpin some", maxRulesFileBytes)
 	}
 	return c
 }

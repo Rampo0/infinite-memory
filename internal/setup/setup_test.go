@@ -48,6 +48,18 @@ func TestMergeSettingsInstallsImemAndKeepsEverythingElse(t *testing.T) {
 	}
 }
 
+func TestMergeSettingsAllowsTheRulesFetch(t *testing.T) {
+	out, _, err := MergeSettings([]byte(userSettings), "/home/me/.local/bin/imem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"Bash(imem rules:*)"`, `"Bash(/home/me/.local/bin/imem rules:*)"`} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("imem rules --here must run without a prompt, missing %s:\n%s", want, out)
+		}
+	}
+}
+
 func TestMergeSettingsIsIdempotent(t *testing.T) {
 	once, _, _ := MergeSettings([]byte(userSettings), "/home/me/.local/bin/imem")
 	twice, changed, err := MergeSettings(once, "/home/me/.local/bin/imem")

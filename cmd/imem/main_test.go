@@ -69,8 +69,8 @@ func TestPickPinTarget(t *testing.T) {
 }
 
 func TestStandingMessageNamesTheRulesFile(t *testing.T) {
-	got := standingMessage(client.SessionStartResponse{Rules: 1, Preferences: 2, RulesFile: 285, PreferencesFile: 116}, 39)
-	if got != "imem: 285 rules + 116 preferences in the rules file, 3 pinned (39ms)" {
+	got := standingMessage(client.SessionStartResponse{RulesFile: 285, PreferencesFile: 116, Pinned: 3}, 39)
+	if got != "imem: 285 rules + 116 preferences on demand (imem rules --here), 3 pinned inline (39ms)" {
 		t.Fatalf("got %q", got)
 	}
 	if got := standingMessage(client.SessionStartResponse{Rules: 3, Preferences: 1}, 5); got != "imem: 3 standing rules, 1 preferences (5ms)" {

@@ -124,6 +124,7 @@ type SessionStartResponse struct {
 	Omitted         int    `json:"omitted"`
 	RulesFile       int    `json:"rules_file"`
 	PreferencesFile int    `json:"preferences_file"`
+	Pinned          int    `json:"pinned"`
 }
 
 func SessionStart(baseURL string, req SessionStartRequest, timeout time.Duration) (SessionStartResponse, error) {

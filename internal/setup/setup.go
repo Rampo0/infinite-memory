@@ -8,6 +8,10 @@ import (
 
 const SearchPermission = "mcp__imem__imem_search"
 
+func RulesPermissions(exe string) []string {
+	return []string{"Bash(imem rules:*)", "Bash(" + exe + " rules:*)"}
+}
+
 var hookEvents = []string{"SessionStart", "UserPromptSubmit", "SubagentStart", "Stop", "SessionEnd"}
 
 func HookGroup(event, exe string, promptTimeout int) map[string]any {
@@ -43,9 +47,11 @@ func MergeSettings(data []byte, exe string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	fields = set(fields, "hooks", hooks)
-	perms, err := mergeAllow(get(fields, "permissions"), SearchPermission)
-	if err != nil {
-		return nil, false, err
+	perms := get(fields, "permissions")
+	for _, p := range append([]string{SearchPermission}, RulesPermissions(exe)...) {
+		if perms, err = mergeAllow(perms, p); err != nil {
+			return nil, false, err
+		}
 	}
 	fields = set(fields, "permissions", perms)
 	after, err := writeObject(fields)
